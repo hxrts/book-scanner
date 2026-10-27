@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 
 from . import books, detect, page
+from .correct import Corrector
 from .config import Config
 from .jobs import JobQueue, PermanentError
 
@@ -27,6 +28,9 @@ DESCRIPTION_MAX = 20000
 class Scanner:
     def __init__(self, cfg):
         self.cfg = cfg
+        page.TESSDATA_DIR = cfg.tessdata_dir or None
+        if cfg.lm_corpus:
+            page.CORRECTOR = Corrector.load(cfg.lm_corpus, cfg.data_dir / "lm.pickle")
         self.last_isbn = {}  # isbn -> time last seen
         self.recent_book = None  # most recent book, attached to subsequent page scans
         self._sheet = None
@@ -145,6 +149,7 @@ class Scanner:
         cap = self.open_camera()
         tracker = detect.StabilityTracker(self.cfg.page_stable_seconds)
         focus = None  # FocusPicker while settling on a capture
+        stacker = None  # FrameStacker once focus has settled
         last_barcode_seen = 0.0
         n = 0
         while True:
@@ -158,10 +163,18 @@ class Scanner:
             n += 1
             now = time.monotonic()
 
+            if stacker is not None:
+                if stacker.update(frame, now):
+                    log.debug("stacked %d frames", len(stacker.frames))
+                    self.on_page(stacker.result(), stacker.corners, stacker.ref_score)
+                    stacker = None
+                continue
+
             if focus is not None:
                 if focus.update(frame, now):
                     log.debug("focus scores: %s", [round(s) for s in focus.scores])
-                    self.on_page(focus.best_frame, focus.corners, focus.best_score)
+                    stacker = detect.FrameStacker(focus.best_frame, focus.corners, focus.best_score,
+                                                  self.cfg.stack_frames, now)
                     focus = None
                 continue
 
@@ -184,6 +197,8 @@ class Scanner:
 
 def process_still(path, cfg):
     """Offline test: detect and process one image, writing results next to it."""
+    if cfg.lm_corpus:
+        page.CORRECTOR = Corrector.load(cfg.lm_corpus, cfg.data_dir / "lm.pickle")
     frame = cv2.imread(str(path))
     if frame is None:
         raise SystemExit(f"cannot read {path}")

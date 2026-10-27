@@ -96,7 +96,7 @@ def ocr_oriented(image_path, lang, low_confidence=40, margin=15):
     PROBE_WIDTH to keep it cheap. If a rotation reads clearly better, the image file is
     rotated in place and OCR is rerun at full size. Returns (text, confidence, degrees).
     """
-    text, conf, vertical = ocr(image_path, lang)
+    text, conf, vertical = ocr(image_path, lang, correct=True)
     # Tesseract can sometimes read sideways text well, so also check word shapes
     if conf >= low_confidence and len(text) >= 20 and vertical < 0.5:
         return text, conf, 0
@@ -123,17 +123,69 @@ def ocr_oriented(image_path, lang, low_confidence=40, margin=15):
     if best_rot is None:
         return text, conf, 0
     cv2.imwrite(str(image_path), cv2.rotate(img, best_rot[0]), [cv2.IMWRITE_JPEG_QUALITY, 92])
-    text, conf, _ = ocr(image_path, lang)
+    text, conf, _ = ocr(image_path, lang, correct=True)
     return text, conf, best_rot[1]
 
 
-def ocr(image_path, lang):
-    """Run Tesseract; returns (text, mean word confidence 0-100, fraction of words taller than wide)."""
-    result = subprocess.run(
-        ["tesseract", str(image_path), "stdout", "-l", lang, "--psm", "3", "tsv"],
-        capture_output=True, text=True, timeout=180, check=True,
-    )
-    words, confs, last_line, tall = [], [], None, 0
+OCR_UPSCALE = 2
+# alternative Tesseract model dir (e.g. tessdata_best); set from config at startup
+TESSDATA_DIR = None
+# correct.Corrector applied to final OCR text; set from config at startup
+CORRECTOR = None
+OCR_MAX_WIDTH = 4000  # cap so very large pages don't blow up OCR time
+
+
+def prepare_for_ocr(img):
+    """Grayscale, 2x upscale and unsharp mask: webcam text is only a few pixels tall,
+    and Tesseract reads it best at ~2x with crisp edges. (Benchmarked against
+    binarization and 3x, both of which did worse.)"""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    scale = min(OCR_UPSCALE, OCR_MAX_WIDTH / gray.shape[1])
+    if scale > 1:
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    return cv2.addWeighted(gray, 2.0, cv2.GaussianBlur(gray, (0, 0), 1.5), -1.0, 0)
+
+
+def _join_hyphenated(words, confs):
+    """Rejoin words split across lines ("stu-" + newline + "dents" -> "students")."""
+    out, out_confs, ci = [], [], 0
+    i = 0
+    while i < len(words):
+        w = words[i]
+        if w in ("\n", "\n\n"):
+            out.append(w)
+            i += 1
+            continue
+        c = confs[ci]
+        ci += 1
+        nxt = words[i + 2] if i + 2 < len(words) and words[i + 1] == "\n" else None
+        if w.endswith("-") and w[:-1].isalpha() and nxt and nxt[:1].islower():
+            out.append(w[:-1] + nxt)
+            out_confs.append(min(c, confs[ci]))
+            ci += 1
+            i += 3  # the fragment, the line break, and the continuation
+            continue
+        out.append(w)
+        out_confs.append(c)
+        i += 1
+    return out, out_confs
+
+
+def ocr(image_path, lang, correct=False):
+    """Run Tesseract; returns (text, mean word confidence 0-100, fraction of words taller than wide).
+
+    With correct=True and a CORRECTOR configured, uncertain words are fixed using context.
+    """
+    prepared = image_path.with_name(image_path.stem + ".ocr.png")
+    cv2.imwrite(str(prepared), prepare_for_ocr(cv2.imread(str(image_path))))
+    cmd = ["tesseract", str(prepared), "stdout", "-l", lang, "--psm", "3", "--dpi", "300"]
+    if TESSDATA_DIR:
+        cmd += ["--tessdata-dir", TESSDATA_DIR]
+    try:
+        result = subprocess.run(cmd + ["tsv"], capture_output=True, text=True, timeout=600, check=True)
+    finally:
+        prepared.unlink(missing_ok=True)
+    words, confs, last_line, tall = [], [], None, 0  # words holds tokens and line-break markers
     for row in result.stdout.splitlines()[1:]:
         cols = row.split("\t")
         if len(cols) < 12 or not cols[11].strip() or float(cols[10]) < 0:
@@ -147,6 +199,12 @@ def ocr(image_path, lang):
         if len(cols[11]) >= 3 and int(cols[9]) > int(cols[8]):
             tall += 1
         last_line = line
+    words, confs = _join_hyphenated(words, confs)
+    if correct and CORRECTOR is not None:
+        positions = [i for i, w in enumerate(words) if w not in ("\n", "\n\n")]
+        fixed = CORRECTOR.correct([(words[i], c) for i, c in zip(positions, confs)])
+        for i, w in zip(positions, fixed):
+            words[i] = w
     text = " ".join(words).replace(" \n ", "\n").replace(" \n\n ", "\n\n").strip()
     long_words = sum(1 for w in words if len(w) >= 3)
     return text, (sum(confs) / len(confs) if confs else 0.0), (tall / long_words if long_words else 0.0)

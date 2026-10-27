@@ -5,3 +5,5 @@ __pycache__/
 !*.env.example
 service-account*.json
 .DS_Store
+test-images/
+data/

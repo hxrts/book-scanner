@@ -77,11 +77,26 @@ def find_page(gray, min_area, max_area=0.98, min_support=0.6):
             if quad is None or not cv2.isContourConvex(quad):
                 continue
             area = cv2.contourArea(quad)
-            if best_area < area < max_area * w * h and _edge_support(quad, edges) >= min_support:
+            if (best_area < area < max_area * w * h and _plausible_page(order_corners(quad), w)
+                    and _edge_support(quad, edges) >= min_support):
                 best, best_area = quad, area
         if best is not None:
             return order_corners(best)
     return None
+
+
+def _plausible_page(corners, frame_width, min_side=0.1, min_angle=45):
+    """Reject shapes no photographed page could make: repeated corners (really a
+    triangle), very short sides, or corners far from square."""
+    for i in range(4):
+        prev, cur, nxt = corners[i - 1], corners[i], corners[(i + 1) % 4]
+        a, b = prev - cur, nxt - cur
+        if min(np.linalg.norm(a), np.linalg.norm(b)) < min_side * frame_width:
+            return False
+        cos = np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+        if not min_angle <= np.degrees(np.arccos(np.clip(cos, -1, 1))) <= 180 - min_angle:
+            return False
+    return True
 
 
 class StabilityTracker:
@@ -144,6 +159,40 @@ class FocusPicker:
         else:
             self.stale += 1
         return self.stale >= self.patience or now - self.started >= self.window
+
+
+class FrameStacker:
+    """Average a few frames once focus has settled, cancelling sensor noise and
+    MJPEG artifacts. Frames that are blurrier or show movement are skipped, so a
+    bumped page degrades to the single sharpest frame rather than a smeared one."""
+
+    def __init__(self, frame, corners, sharpness_score, count, now, window=1.5,
+                 min_sharpness_ratio=0.85, max_motion=6.0):
+        self.corners = corners
+        self.ref_score = sharpness_score
+        self.count = count
+        self.deadline = now + window
+        self.min_ratio = min_sharpness_ratio
+        self.max_motion = max_motion  # mean abs grey-level change over the page
+        self.ref_small = self._small(frame)
+        self.frames = [frame]
+
+    def _small(self, frame):
+        x, y, w, h = cv2.boundingRect(self.corners.astype(np.int32))
+        crop = cv2.cvtColor(frame[max(y, 0):y + h, max(x, 0):x + w], cv2.COLOR_BGR2GRAY)
+        return cv2.resize(crop, (160, 160), interpolation=cv2.INTER_AREA).astype(np.float32)
+
+    def update(self, frame, now):
+        """Returns True when done; result() gives the averaged frame."""
+        moved = np.abs(self._small(frame) - self.ref_small).mean() > self.max_motion
+        if not moved and sharpness(frame, self.corners) >= self.min_ratio * self.ref_score:
+            self.frames.append(frame)
+        return len(self.frames) >= self.count or now >= self.deadline
+
+    def result(self):
+        if len(self.frames) == 1:
+            return self.frames[0]
+        return np.clip(np.mean([f.astype(np.float32) for f in self.frames], axis=0), 0, 255).astype(np.uint8)
 
 
 def downscale(frame):

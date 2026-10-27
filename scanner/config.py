@@ -32,6 +32,12 @@ class Config:
     # cap on images kept from finished jobs; oldest are deleted first
     keep_mb: int = field(default_factory=lambda: int(_env("SCANNER_KEEP_MB", "2048")))
     ocr_lang: str = field(default_factory=lambda: _env("SCANNER_OCR_LANG", "eng"))
+    # optional directory with tessdata_best models: ~3 points better OCR, ~3x slower
+    tessdata_dir: str = field(default_factory=lambda: _env("SCANNER_TESSDATA_DIR", ""))
+    # context-aware OCR correction: plain-text corpus for the language model (empty disables)
+    lm_corpus: str = field(default_factory=lambda: _env("SCANNER_LM_CORPUS", "~/scanner/data/big.txt"))
+    # frames averaged after focus settles, to cancel sensor noise and JPEG artifacts
+    stack_frames: int = field(default_factory=lambda: int(_env("SCANNER_STACK_FRAMES", "5")))
 
     # google sheets
     sheet_id: str = field(default_factory=lambda: _env("GOOGLE_SHEET_ID", ""))

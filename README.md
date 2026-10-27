@@ -3,7 +3,7 @@
 A Raspberry Pi + webcam system that watches a surface and performs one of two functions depending on what is in view:
 
 - **ISBN barcode** → looks the book up on Open Library → appends a row to a Google Sheet.
-- **Book page** → waits for focus, crops and flattens the page, corrects colour and lighting, OCRs it → uploads the image, text and metadata to an Are.na channel.
+- **Book page** → waits for focus, averages a few frames, crops and flattens the page, corrects colour and lighting, OCRs it and fixes uncertain words using their context → uploads the image, text and metadata to an Are.na channel.
 
 Captures are written to disk before processing and retried every 5 minutes on failure, so nothing is lost offline.
 
@@ -11,13 +11,15 @@ Captures are written to disk before processing and retried every 5 minutes on fa
 
 Raspberry Pi 3 B (Raspberry Pi OS Lite, Trixie, 32-bit) and a USB webcam (tested with a Logitech BRIO). A plain, dark surface under the camera gives the most reliable page detection.
 
+**OCR quality depends mostly on how large the text is in the frame.** The BRIO tops out at 1080p over the Pi's USB 2.0, so mount the camera close enough that a single page fills most of the frame. In testing, that gives about 1% character errors, while a two-page spread with the same type gives about 25%.
+
 ## Setup
 
 On the Pi:
 
 ```sh
 sudo apt install python3-opencv python3-numpy python3-requests python3-pyzbar \
-  python3-venv tesseract-ocr tesseract-ocr-eng v4l-utils rsync
+  python3-venv tesseract-ocr tesseract-ocr-eng v4l-utils rsync wamerican
 ```
 
 From your machine:
@@ -53,6 +55,7 @@ python -m scanner.main --image photo.jpg
 | `scanner/main.py` | Camera loop, job handlers, `--image` mode |
 | `scanner/detect.py` | Barcode, page and stability detection; focus selection |
 | `scanner/page.py` | Perspective warp, deskew, colour correction, OCR with sideways check |
+| `scanner/correct.py` | Context-aware correction of uncertain OCR words (bigram language model) |
 | `scanner/books.py` | Open Library lookup |
 | `scanner/sheets.py` | Google Sheets append |
 | `scanner/arena.py` | Are.na presigned upload and block creation |
@@ -71,9 +74,12 @@ Set these in `scanner.env`:
 | `SCANNER_ISBN_COOLDOWN_S` | `60` | How long a barcode must be out of view before it can be added again |
 | `SCANNER_KEEP_MB` | `2048` | Image storage cap; oldest finished scans are deleted first, pending ones never |
 | `SCANNER_OCR_LANG` | `eng` | Tesseract language(s), e.g. `eng+deu` |
+| `SCANNER_STACK_FRAMES` | `5` | Frames averaged per capture to reduce noise (`1` disables) |
+| `SCANNER_LM_CORPUS` | `~/scanner/data/big.txt` | Plain-text corpus for context-aware OCR correction (empty disables); `deploy.sh` downloads it |
+| `SCANNER_TESSDATA_DIR` | unset | Directory with [tessdata_best](https://github.com/tesseract-ocr/tessdata_best) models: slightly better OCR, about 3x slower |
 
 ## Limitations
 
 - Lines curve near the spine of thick books, since only perspective is corrected, not page curl.
 - A page partly covered by objects on a busy background is skipped rather than cropped wrongly.
-- On a Pi 3, OCR takes 1–12 s per page, and 20–30 s for a page that is sideways.
+- On a Pi 3, OCR takes about 5–25 s per page, and longer for a page that is sideways.
