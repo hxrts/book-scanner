@@ -1,6 +1,6 @@
 # book-scanner
 
-A Raspberry Pi + webcam that watches a desk and:
+A Raspberry Pi + webcam system that watches a surface and performs one of two functions depending on what is in view:
 
 - **ISBN barcode** → looks the book up on Open Library → appends a row to a Google Sheet.
 - **Book page** → waits for focus, crops and flattens the page, corrects colour and lighting, OCRs it → uploads the image, text and metadata to an Are.na channel.
@@ -35,7 +35,7 @@ Run `./deploy.sh` again to start the service. Logs: `journalctl -u scanner -f`.
 
 ## Usage
 
-- Hold a barcode up to the camera. The same ISBN is ignored for 30 s.
+- Hold a barcode up to the camera. Rescanning the same ISBN works once it has been out of view for 1 min.
 - Lay a page flat and hold it still for about 1 s. It's captured once per placement; move or replace the page for the next one.
 
 Pages scanned after a barcode are tagged with that book in their Are.na metadata.
@@ -68,7 +68,7 @@ Set these in `scanner.env`:
 | `SCANNER_PAGE_MIN_AREA` | `0.15` | Smallest page, as a fraction of the frame |
 | `SCANNER_PAGE_STABLE_S` | `1.0` | How long a page must be still before capture |
 | `SCANNER_MIN_SHARPNESS` | `30` | Focus score below which a capture is skipped (each capture's score is logged) |
-| `SCANNER_ISBN_COOLDOWN_S` | `30` | How long a repeat ISBN is ignored |
+| `SCANNER_ISBN_COOLDOWN_S` | `60` | How long a barcode must be out of view before it can be added again |
 | `SCANNER_KEEP_MB` | `2048` | Image storage cap; oldest finished scans are deleted first, pending ones never |
 | `SCANNER_OCR_LANG` | `eng` | Tesseract language(s), e.g. `eng+deu` |
 

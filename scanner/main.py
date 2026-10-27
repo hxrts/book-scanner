@@ -27,7 +27,7 @@ DESCRIPTION_MAX = 20000
 class Scanner:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.last_isbn = {}  # isbn -> time last queued
+        self.last_isbn = {}  # isbn -> time last seen
         self.recent_book = None  # most recent book, attached to subsequent page scans
         self._sheet = None
         self._arena = None
@@ -99,9 +99,12 @@ class Scanner:
     # --- capture side (main thread) ---
 
     def on_isbn(self, isbn, now):
-        if now - self.last_isbn.get(isbn, 0) < self.cfg.isbn_cooldown_seconds:
-            return
+        # duplicates are suppressed until the barcode has been out of view for the cooldown,
+        # so a barcode left in front of the camera isn't re-added
+        last_seen = self.last_isbn.get(isbn)
         self.last_isbn[isbn] = now
+        if last_seen is not None and now - last_seen < self.cfg.isbn_cooldown_seconds:
+            return
         log.info("ISBN detected: %s", isbn)
         self.jobs.submit("isbn", {"isbn": isbn})
 
