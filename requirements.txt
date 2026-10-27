@@ -1,0 +1,2 @@
+# system packages (apt): python3-opencv python3-numpy python3-requests python3-pyzbar tesseract-ocr tesseract-ocr-eng
+gspread>=6

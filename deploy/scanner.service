@@ -1,0 +1,15 @@
+[Unit]
+Description=Book/page scanner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/scanner
+EnvironmentFile=/home/pi/.config/scanner/scanner.env
+ExecStart=/home/pi/scanner/.venv/bin/python -m scanner.main
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
