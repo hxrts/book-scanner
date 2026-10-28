@@ -39,7 +39,15 @@ Run `./deploy.sh` again to start the service. Logs: `journalctl -u scanner -f`.
 
 - Hold a barcode up to the camera. Rescanning the same ISBN works once it has been out of view for 1 min.
 - **First page after start:** the lens sweeps focus over it for a few seconds, locks the sharpest setting, and saves it as the starting point for next time. Hold still until the log shows `focus calibrated`; that placement only calibrates and isn't uploaded.
-- Hold the book open (hands along the edges are fine, but keep them off the text) and keep it still for about 3 s. Each visible page becomes its own Are.na block, so an open spread gives two, left page first. One capture per placement; move or turn the page for the next one.
+- Hold the book open (hands along the edges are fine, but keep them off the text) and keep it still for about 4 s. Each visible page becomes its own Are.na block, so an open spread gives two, left page first. One capture per placement; move or turn the page for the next one.
+
+Recommended timings (Pi 3, BRIO at 1080p):
+
+| Step | Hold for | Why |
+|---|---|---|
+| Focus calibration (first page after start) | ~10 s | 1 s to settle, then the lens tries ~7 focus values at ~1 s each |
+| Each capture | ≥ 4 s | 1 s to settle, ~1 s picking the sharpest frame, ~1–1.5 s averaging frames |
+| Between captures | Turn the page once the log shows `page(s) captured` | Moving the book re-arms capture; there's no cooldown, but uploads lag ~1–1.5 min per page as the queue drains |
 
 Pages scanned after a barcode are tagged with that book in their Are.na metadata.
 
