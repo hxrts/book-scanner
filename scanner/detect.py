@@ -53,12 +53,13 @@ def _edge_support(quad, edges):
     return np.count_nonzero(edges[on_outline]) / max(1, np.count_nonzero(on_outline))
 
 
-def find_page(gray, min_area, max_area=0.98, min_support=0.6):
+def find_page(gray, min_area, max_area=0.98, min_support=0.6, color=None):
     """Find the page: the largest convex quadrilateral covering min_area..max_area
     of the frame whose border mostly follows real edges.
 
     Tries the edge map first and falls back to bright regions (paper on a busy
-    background). Returns ordered corners in `gray` coordinates, or None.
+    background). If `color` (the same frame in BGR) is given, the region must also
+    look like paper. Returns ordered corners in `gray` coordinates, or None.
     """
     h, w = gray.shape
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -78,11 +79,30 @@ def find_page(gray, min_area, max_area=0.98, min_support=0.6):
                 continue
             area = cv2.contourArea(quad)
             if (best_area < area < max_area * w * h and _plausible_page(order_corners(quad), w)
-                    and _edge_support(quad, edges) >= min_support):
+                    and not _touches_frame(order_corners(quad), w, h)
+                    and _edge_support(quad, edges) >= min_support
+                    and (color is None or _looks_like_paper(color, quad))):
                 best, best_area = quad, area
         if best is not None:
             return order_corners(best)
     return None
+
+
+def _looks_like_paper(color, quad, max_green=0.6):
+    """Reject large uniformly green/teal regions (cutting mats, desk pads). Paper is
+    neutral or warm; illustrations are mixed, so only a dominant colour counts."""
+    mask = np.zeros(color.shape[:2], np.uint8)
+    cv2.fillConvexPoly(mask, quad.reshape(-1, 2), 255)
+    hsv = cv2.cvtColor(color, cv2.COLOR_BGR2HSV)[mask > 0]
+    green = (hsv[:, 0] >= 35) & (hsv[:, 0] <= 100) & (hsv[:, 1] > 20)
+    return green.mean() <= max_green
+
+
+def _touches_frame(corners, w, h, margin=3):
+    """A quad with two or more corners on the frame edge is the frame itself or a
+    surface running out of view, not a page whose edges we can crop to."""
+    on_edge = [x <= margin or y <= margin or x >= w - 1 - margin or y >= h - 1 - margin for x, y in corners]
+    return sum(on_edge) >= 2
 
 
 def _plausible_page(corners, frame_width, min_side=0.1, min_angle=45):
@@ -99,6 +119,61 @@ def _plausible_page(corners, frame_width, min_side=0.1, min_angle=45):
     return True
 
 
+def find_text_pages(gray, work_width=960, min_rows=15, min_area=0.03, margin=0.05):
+    """Find pages by their printed text, for when page edges are hidden (hands
+    holding the book open, a spread running out of frame).
+
+    Dark word-shaped blobs on bright paper are grouped into text blocks; blocks
+    in the same column are merged (a hand across a page splits it), and each
+    column becomes one page, so a spread yields its two pages left to right.
+    Returns a list of corner arrays (padded by `margin`) in `gray` coordinates.
+    """
+    scale = work_width / gray.shape[1]
+    g = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    H, W = g.shape
+    ink = cv2.morphologyEx(g, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9)))
+    ink = cv2.threshold(ink, 30, 255, cv2.THRESH_BINARY)[1]
+    words = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (9, 1)))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(words)
+    x, y, w, h = stats[:, 0], stats[:, 1], stats[:, 2], stats[:, 3]
+    cx, cy = np.clip(x + w // 2, 0, W - 1), np.clip(y + h // 2, 0, H - 1)
+    paper = cv2.dilate(g, np.ones((7, 7), np.uint8))  # brightest nearby pixel = the paper behind a word
+    is_word = (h >= 2) & (h <= 14) & (w >= 1.5 * h) & (w <= 0.3 * W) & (paper[cy, cx] > 150)
+    is_word[0] = False  # background
+    mask = is_word[labels].astype(np.uint8) * 255
+
+    blocks = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (13, 19)))
+    nb, block_labels, block_stats, _ = cv2.connectedComponentsWithStats(blocks)
+    ids = np.nonzero(is_word)[0]
+    owner = block_labels[cy[ids], cx[ids]]
+    columns = []
+    for b in range(1, nb):
+        mine = ids[owner == b]
+        bw, bh = block_stats[b, 2:4]
+        if bw * bh < min_area * W * H or len(np.unique(cy[mine] // 6)) < min_rows:
+            continue
+        pts = np.concatenate([np.stack([x[mine], y[mine]], 1),
+                              np.stack([x[mine] + w[mine], y[mine] + h[mine]], 1)]).astype(np.float32)
+        x0, x1 = pts[:, 0].min(), pts[:, 0].max()
+        for i, col in enumerate(columns):
+            c0, c1 = col[:, 0].min(), col[:, 0].max()
+            if min(x1, c1) - max(x0, c0) > 0.5 * min(x1 - x0, c1 - c0):
+                columns[i] = np.vstack([col, pts])
+                break
+        else:
+            columns.append(pts)
+
+    pages = []
+    for pts in sorted(columns, key=lambda p: p[:, 0].min()):
+        (px, py), (pw, ph), angle = cv2.minAreaRect(pts)
+        if angle > 45:
+            pw, ph, angle = ph, pw, angle - 90
+        pad = margin * max(pw, ph)
+        box = cv2.boxPoints(((px, py), (pw + 2 * pad, ph + 2 * pad), angle)) / scale
+        pages.append(order_corners(np.clip(box, 0, [gray.shape[1] - 1, gray.shape[0] - 1])))
+    return pages
+
+
 class StabilityTracker:
     """Reports a page once its corners have stayed put for `hold` seconds."""
 
@@ -113,7 +188,8 @@ class StabilityTracker:
         if corners is None:
             self.anchor, self.fired = None, False
             return False
-        moved = self.anchor is None or np.abs(corners - self.anchor).max() > self.tolerance * width
+        moved = (self.anchor is None or corners.shape != self.anchor.shape
+                 or np.abs(corners - self.anchor).max() > self.tolerance * width)
         if moved:
             self.anchor, self.since, self.fired = corners, now, False
             return False
@@ -196,6 +272,7 @@ class FrameStacker:
 
 
 def downscale(frame):
+    """Returns (grey, colour, scale) at detection size."""
     scale = DETECT_WIDTH / frame.shape[1]
     small = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-    return cv2.cvtColor(small, cv2.COLOR_BGR2GRAY), scale
+    return cv2.cvtColor(small, cv2.COLOR_BGR2GRAY), small, scale

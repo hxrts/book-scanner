@@ -19,6 +19,11 @@ class Config:
     width: int = field(default_factory=lambda: int(_env("SCANNER_WIDTH", "1920")))
     height: int = field(default_factory=lambda: int(_env("SCANNER_HEIGHT", "1080")))
     fps: int = field(default_factory=lambda: int(_env("SCANNER_FPS", "15")))
+    # lens focus: "calibrate" (sweep and lock onto the first page seen after start),
+    # "auto" (continuous autofocus), or a fixed value (BRIO: 0-255, higher = nearer)
+    focus: str = field(default_factory=lambda: _env("SCANNER_FOCUS", "calibrate"))
+    # rotate frames so pages read upright (0, 90, 180 or 270, clockwise)
+    rotate: int = field(default_factory=lambda: int(_env("SCANNER_ROTATE", "0")))
 
     # detection tuning
     page_min_area: float = field(default_factory=lambda: float(_env("SCANNER_PAGE_MIN_AREA", "0.15")))
