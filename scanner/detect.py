@@ -105,9 +105,15 @@ def _touches_frame(corners, w, h, margin=3):
     return sum(on_edge) >= 2
 
 
-def _plausible_page(corners, frame_width, min_side=0.1, min_angle=45):
+def _plausible_page(corners, frame_width, min_side=0.1, min_angle=45, min_side_ratio=0.8):
     """Reject shapes no photographed page could make: repeated corners (really a
-    triangle), very short sides, or corners far from square."""
+    triangle), very short sides, corners far from square, or opposite sides of very
+    different length (an overhead camera sees a page as nearly a rectangle; a lopsided
+    quad is usually a page edge joined to a hand or the mat)."""
+    sides = [np.linalg.norm(corners[(i + 1) % 4] - corners[i]) for i in range(4)]
+    for a, b in ((sides[0], sides[2]), (sides[1], sides[3])):
+        if min(a, b) < min_side_ratio * max(a, b):
+            return False
     for i in range(4):
         prev, cur, nxt = corners[i - 1], corners[i], corners[(i + 1) % 4]
         a, b = prev - cur, nxt - cur
