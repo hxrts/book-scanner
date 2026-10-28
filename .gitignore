@@ -7,3 +7,4 @@ service-account*.json
 .DS_Store
 test-images/
 data/
+work/
