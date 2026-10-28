@@ -180,28 +180,197 @@ def find_text_pages(gray, work_width=960, min_rows=15, min_area=0.03, margin=0.0
     return pages
 
 
-class StabilityTracker:
-    """Reports a page once its corners have stayed put for `hold` seconds."""
+BG_WIDTH = 480  # working width for background subtraction
 
-    def __init__(self, hold, tolerance=0.02):
+
+def background_frame(frame):
+    """Downscaled, blurred copy of a frame, as used for background subtraction."""
+    scale = BG_WIDTH / frame.shape[1]
+    small = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    return cv2.GaussianBlur(small, (5, 5), 0)
+
+
+def _mat_coloured(small):
+    """Pixels coloured like a green/teal cutting mat."""
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    return (hsv[..., 0] >= 70) & (hsv[..., 0] <= 100) & (hsv[..., 1] > 25) & (hsv[..., 2] < 170)
+
+
+def surface_region(background, overhang=0.06):
+    """Where books can be: the cutting mat's outline in the background, widened a
+    little so a book overhanging its edge still counts. None if there's no mat."""
+    mat = _mat_coloured(background).astype(np.uint8) * 255
+    mat = cv2.morphologyEx(mat, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mat)
+    if n < 2:
+        return None
+    biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    if stats[biggest, cv2.CC_STAT_AREA] < 0.2 * mat.size:
+        return None
+    region = np.zeros_like(mat)
+    cv2.fillConvexPoly(region, cv2.convexHull(cv2.findNonZero((labels == biggest).astype(np.uint8))), 255)
+    grow = int(overhang * mat.shape[1]) | 1
+    return cv2.dilate(region, np.ones((grow, grow), np.uint8))
+
+
+def find_pages_by_background(frame, background, region=None, min_area=0.04, margin=0.02, spread_ratio=1.0):
+    """Find the book as whatever differs from the empty surface, so pages of any
+    colour or content are found. Needs a fixed camera.
+
+    Skin is removed so hands holding the book don't count, a rectangle is fitted
+    to what's left, and a wide one (an open spread) is split at the gutter. Returns
+    corner arrays in `frame` coordinates, left page first.
+    """
+    small = background_frame(frame)
+    scale = small.shape[1] / frame.shape[1]
+    fg = (_background_diff(small, background) > 30).astype(np.uint8) * 255
+    fg[cv2.dilate(_hands(small), np.ones((15, 15), np.uint8)) > 0] = 0
+    # a shifted cutting mat differs from the background but is never the book
+    fg[_mat_coloured(small)] = 0
+    if region is not None:
+        fg[region == 0] = 0  # off the mat, only exposure shifts happen, not books
+    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, np.ones((15, 15), np.uint8))  # cut off wrists, cables
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(fg)
+    if n < 2:
+        return []
+    areas = stats[:, cv2.CC_STAT_AREA].copy()
+    areas[0] = 0
+    if areas.max() < min_area * fg.size:
+        return []
+    # the book can fall apart into pieces (a spread split at a dark gutter); keep all big ones
+    mask = (areas[labels] >= 0.25 * areas.max()).astype(np.uint8)
+    # fill holes (dark print can match the dark mat) so the book is one solid shape
+    outline, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(mask, outline, -1, 1, cv2.FILLED)
+    # fit a rotated box, trim sparse fringes (leftover fingers, shadows) by keeping
+    # the well-filled rows and columns, then refit on what's left so stray pixels
+    # don't skew the angle
+    for _ in range(2):
+        points = cv2.findNonZero(mask)
+        if points is None or len(points) < 20:  # trimming left nothing solid
+            return []
+        (cx, cy), (w, h), angle = cv2.minAreaRect(points)
+        if angle > 45:
+            w, h, angle = h, w, angle - 90
+        # work in the book's own axes: x across the spread, y down the page
+        to_book = cv2.getRotationMatrix2D((cx, cy), angle, 1)
+        upright = cv2.warpAffine(mask, to_book, (mask.shape[1], mask.shape[0]), flags=cv2.INTER_NEAREST)
+        x0, x1 = _filled_span(upright.mean(axis=0))
+        y0, y1 = _filled_span(upright.mean(axis=1))
+        if x1 - x0 < 10 or y1 - y0 < 10:
+            return []
+        trimmed = np.zeros_like(upright)
+        trimmed[y0:y1, x0:x1] = upright[y0:y1, x0:x1]
+        mask = cv2.warpAffine(trimmed, cv2.invertAffineTransform(to_book), (mask.shape[1], mask.shape[0]),
+                              flags=cv2.INTER_NEAREST)
+    pad_x, pad_y = margin * (x1 - x0), margin * (y1 - y0)
+    x0, x1, y0, y1 = x0 - pad_x, x1 + pad_x, y0 - pad_y, y1 + pad_y
+    w, h = x1 - x0, y1 - y0
+    cuts = [x0, x1]
+    if w > spread_ratio * h:
+        # the gutter is the darkest column near the middle
+        gray = cv2.cvtColor(cv2.warpAffine(small, to_book, (small.shape[1], small.shape[0])), cv2.COLOR_BGR2GRAY)
+        cols = gray[max(int(y0), 0):int(y1), max(int(x0), 0):int(x1)].mean(axis=0)
+        mid, reach = len(cols) // 2, len(cols) // 5
+        cuts = [x0, max(x0, 0) + mid - reach + int(np.argmin(cols[mid - reach:mid + reach])), x1]
+    from_book = cv2.invertAffineTransform(to_book)
+    pages = []
+    for left, right in zip(cuts, cuts[1:]):
+        box = np.array([[[left, y0], [right, y0], [right, y1], [left, y1]]], np.float32)
+        pages.append(order_corners(cv2.transform(box, from_book)[0] / scale))
+    return pages
+
+
+def _background_diff(small, background):
+    """Per-pixel colour difference from the background, after matching the
+    background's overall colour to the frame. Auto exposure and white balance shift
+    the whole image when a book comes into view; since the book covers well under
+    half of it, the median per-channel ratio measures that shift."""
+    f, b = small.astype(np.float32), background.astype(np.float32)
+    fs, bs = f[::4, ::4].reshape(-1, 3), b[::4, ::4].reshape(-1, 3)
+    # clipped highlights can't follow an exposure change, so measure it on mid-tones
+    mid = ((fs > 15) & (fs < 235) & (bs > 15) & (bs < 235)).all(axis=1)
+    gains = np.median((fs[mid] + 1) / (bs[mid] + 1), axis=0) if mid.sum() > 100 else np.ones(3)
+    matched = np.clip(b * gains, 0, 255).astype(np.uint8)
+    diff = cv2.absdiff(cv2.cvtColor(small, cv2.COLOR_BGR2LAB), cv2.cvtColor(matched, cv2.COLOR_BGR2LAB)).max(axis=2)
+    # near-white in both (a desk blown out by exposure) is not a change
+    diff[(small.min(axis=2) > 215) & (matched.min(axis=2) > 200)] = 0
+    return diff
+
+
+def _filled_span(profile, frac=0.4, max_gap=25):
+    """Longest run of a fill profile above `frac` of its peak, as (start, end)."""
+    profile = np.convolve(profile, np.ones(9) / 9, mode="same")
+    above = (profile >= frac * profile.max()).astype(np.uint8)
+    # bridge narrow dips such as the gutter of a spread
+    above = cv2.morphologyEx(above[None], cv2.MORPH_CLOSE, np.ones((1, max_gap), np.uint8))[0].astype(bool)
+    best, start = (0, 0), None
+    for i, on in enumerate(np.append(above, False)):
+        if on and start is None:
+            start = i
+        elif not on and start is not None:
+            if i - start > best[1] - best[0]:
+                best = (start, i)
+            start = None
+    return best
+
+
+def _hands(small):
+    """Mask of hands and arms: solid skin-coloured regions reaching the frame edge.
+    Red or orange covers have skin-like pixels too, but scattered among others and
+    not attached to an arm coming in from outside the frame."""
+    skin = cv2.inRange(cv2.cvtColor(small, cv2.COLOR_BGR2YCrCb), (0, 136, 70), (255, 185, 125))
+    skin = cv2.morphologyEx(skin, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(skin)
+    h, w = skin.shape
+    x, y, bw, bh = stats[:, 0], stats[:, 1], stats[:, 2], stats[:, 3]
+    at_edge = (x == 0) | (y == 0) | (x + bw >= w) | (y + bh >= h)
+    at_edge[0] = False
+    return at_edge[labels].astype(np.uint8) * 255
+
+
+def foreground_fraction(frame, background):
+    """Share of the view that differs from the background (for drift updates)."""
+    diff = _background_diff(background_frame(frame), background)
+    return float(np.count_nonzero(diff > 30)) / diff.size
+
+
+def has_text(img, min_rows=5):
+    """Whether an image (a processed page) carries enough lines of text to OCR."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return bool(find_text_pages(gray, min_rows=min_rows, min_area=0.01))
+
+
+class StabilityTracker:
+    """Reports a page once its corners have stayed put for `hold` seconds.
+
+    A single odd frame (the webcam sends occasional corrupt JPEGs, and detection
+    can drop out for a frame) is ignored; it takes `patience` disagreeing frames
+    in a row to reset.
+    """
+
+    def __init__(self, hold, tolerance=0.03, patience=3):
         self.hold = hold
         self.tolerance = tolerance  # fraction of frame width
+        self.patience = patience
         self.anchor = None
         self.since = None
         self.fired = False
+        self.misses = 0  # consecutive frames disagreeing with the anchor
 
     def update(self, corners, width, now):
-        if corners is None:
-            self.anchor, self.fired = None, False
+        agrees = (corners is not None and self.anchor is not None and corners.shape == self.anchor.shape
+                  and np.abs(corners - self.anchor).max() <= self.tolerance * width)
+        if agrees:
+            self.misses = 0
+            if not self.fired and now - self.since >= self.hold:
+                self.fired = True  # one capture per placement; re-arms when the page moves or leaves
+                return True
             return False
-        moved = (self.anchor is None or corners.shape != self.anchor.shape
-                 or np.abs(corners - self.anchor).max() > self.tolerance * width)
-        if moved:
-            self.anchor, self.since, self.fired = corners, now, False
-            return False
-        if not self.fired and now - self.since >= self.hold:
-            self.fired = True  # one capture per placement; re-arms when the page moves or leaves
-            return True
+        self.misses += 1
+        if self.anchor is None or self.misses >= self.patience:
+            self.anchor, self.since, self.fired, self.misses = corners, now, False, 0
         return False
 
 

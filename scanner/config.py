@@ -22,6 +22,9 @@ class Config:
     # lens focus: "calibrate" (sweep and lock onto the first page seen after start),
     # "auto" (continuous autofocus), or a fixed value (BRIO: 0-255, higher = nearer)
     focus: str = field(default_factory=lambda: _env("SCANNER_FOCUS", "calibrate"))
+    # learn the empty surface at startup and find pages of any colour against it
+    use_background: bool = field(default_factory=lambda: _env("SCANNER_BACKGROUND", "1") == "1")
+    mains_hz: int = field(default_factory=lambda: int(_env("SCANNER_MAINS_HZ", "50")))  # anti-flicker
     # rotate frames so pages read upright (0, 90, 180 or 270, clockwise)
     rotate: int = field(default_factory=lambda: int(_env("SCANNER_ROTATE", "0")))
 
@@ -42,6 +45,8 @@ class Config:
     # optional directory with tessdata_best models: ~3 points better OCR, ~3x slower
     tessdata_dir: str = field(default_factory=lambda: _env("SCANNER_TESSDATA_DIR", ""))
     # context-aware OCR correction: plain-text corpus for the language model (empty disables)
+    # colour correction matrix from `python -m scanner.colorfit` (ignored if missing)
+    color_matrix: Path = field(default_factory=lambda: Path(_env("SCANNER_COLOR_MATRIX", "~/.config/scanner/color.json")).expanduser())
     lm_corpus: str = field(default_factory=lambda: _env("SCANNER_LM_CORPUS", "~/scanner/data/big.txt"))
     # frames averaged after focus settles, to cancel sensor noise and JPEG artifacts
     stack_frames: int = field(default_factory=lambda: int(_env("SCANNER_STACK_FRAMES", "5")))

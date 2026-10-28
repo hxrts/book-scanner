@@ -87,8 +87,30 @@ def sharpen(img, amount=0.6, sigma=1.2):
     return cv2.addWeighted(img, 1 + amount, cv2.GaussianBlur(img, (0, 0), sigma), -amount, 0)
 
 
+def paper_fraction(img):
+    """Share of the page that is plain paper (light and nearly colourless)."""
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    return float(np.count_nonzero((hsv[..., 2] > 140) & (hsv[..., 1] < 60))) / (img.shape[0] * img.shape[1])
+
+
+# 3x4 colour correction matrix (BGR, 0-1) fitted by colorfit.py; set from config at startup
+COLOR_MATRIX = None
+
+
+def apply_color_matrix(img, matrix):
+    x = img.reshape(-1, 3).astype(np.float32) / 255
+    out = x @ matrix[:, :3].T + matrix[:, 3]
+    return np.clip(out * 255, 0, 255).astype(np.uint8).reshape(img.shape)
+
+
 def process(frame, corners):
-    return sharpen(color_correct(deskew(trim_border(warp(frame, corners)))))
+    img = deskew(trim_border(warp(frame, corners)))
+    # paper white-balance and lighting flattening would wash out photos and colour pages
+    if paper_fraction(img) >= 0.6:
+        img = color_correct(img)
+    img = sharpen(img)
+    # the matrix is fitted on output of the steps above, so it goes last
+    return img if COLOR_MATRIX is None else apply_color_matrix(img, COLOR_MATRIX)
 
 
 PROBE_WIDTH = 1200

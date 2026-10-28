@@ -5,6 +5,7 @@
 """
 
 import argparse
+import json
 import logging
 import subprocess
 import time
@@ -23,17 +24,23 @@ log = logging.getLogger("scanner")
 
 BARCODE_EVERY_N_FRAMES = 3
 TITLE_MAX = 80
+DUMP_FLAG = Path("/tmp/scanner-dump")  # touch to save a debug snapshot of detection
 DEFAULT_FOCUS = 15  # BRIO over the scanning mat; calibration searches around the last value
 ROTATIONS = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
 DESCRIPTION_MAX = 20000
 
 
+def load_color_matrix(path):
+    if path.exists():
+        page.COLOR_MATRIX = np.array(json.loads(path.read_text())["matrix"], dtype=np.float32)
+        log.info("colour correction matrix loaded from %s", path)
+
+
 def set_focus(device, value):
-    subprocess.run(["v4l2-ctl", "-d", device, "-c", "focus_automatic_continuous=0"], check=True)
-    subprocess.run(["v4l2-ctl", "-d", device, "-c", f"focus_absolute={value}"], check=True)
+    v4l2(device, focus_automatic_continuous=0, focus_absolute=value)
 
 
-def calibrate_focus(cap, device, corners, center, steps=3, step=5):
+def calibrate_focus(read, device, corners, center, steps=3, step=5):
     """Try focus values within `steps` steps of `center` (the last calibration)
     over the page, extending past the edge if the peak lies there, and return the sharpest. Takes a few seconds; the page should
     be held still meanwhile."""
@@ -41,8 +48,8 @@ def calibrate_focus(cap, device, corners, center, steps=3, step=5):
         set_focus(device, value)
         time.sleep(0.3)
         for _ in range(4):  # flush frames from before the lens moved
-            cap.read()
-        return float(np.median([detect.sharpness(cap.read()[1], corners) for _ in range(3)]))
+            read()
+        return float(np.median([detect.sharpness(read(), corners) for _ in range(3)]))
 
     values = range(max(0, center - steps * step), min(255, center + steps * step) + 1, step)
     scores = {v: score(v) for v in values}
@@ -58,26 +65,43 @@ def calibrate_focus(cap, device, corners, center, steps=3, step=5):
     set_focus(device, best)
     time.sleep(0.3)
     for _ in range(4):
-        cap.read()
+        read()
     return best
 
 
-def find_pages(frame, min_area, margin):
-    """Pages in a full-size frame: a fully visible page by its edges, else by its text."""
+def find_pages(frame, min_area, margin, background=None, region=None):
+    """Pages in a full-size frame: against the learned background if there is one
+    (any page content), else by their text, else by their edges."""
+    if background is not None:
+        return detect.find_pages_by_background(frame, background, region)
+    pages = detect.find_text_pages(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), margin=margin)
+    if pages:
+        return pages
     gray, small, scale = detect.downscale(frame)
     corners = detect.find_page(gray, min_area, color=small)
-    if corners is not None:
-        return [corners / scale]
-    return detect.find_text_pages(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), margin=margin)
+    return [] if corners is None else [corners / scale]
+
+
+def v4l2(device, **controls):
+    for name, value in controls.items():
+        subprocess.run(["v4l2-ctl", "-d", device, "-c", f"{name}={value}"], check=True)
+
+
+def v4l2_get(device, name):
+    out = subprocess.run(["v4l2-ctl", "-d", device, "-C", name], capture_output=True, text=True, check=True)
+    return int(out.stdout.split(":")[1])
 
 
 class Scanner:
     def __init__(self, cfg):
         self.cfg = cfg
         page.TESSDATA_DIR = cfg.tessdata_dir or None
+        load_color_matrix(cfg.color_matrix)
         if cfg.lm_corpus:
             page.CORRECTOR = Corrector.load(cfg.lm_corpus, cfg.data_dir / "lm.pickle")
         self.focus = int(cfg.focus) if cfg.focus.isdigit() else None  # fixed lens focus, once known
+        self.background = None  # empty-surface frame, learned at startup
+        self.region = None  # where books can be (the mat), from the background
         self.last_isbn = {}  # isbn -> time last seen
         self.recent_book = None  # most recent book, attached to subsequent page scans
         self._sheet = None
@@ -118,9 +142,12 @@ class Scanner:
             processed = page.process(raw, np.array(job["corners"], dtype=np.float32))
             cv2.imwrite(str(out), processed, [cv2.IMWRITE_JPEG_QUALITY, 92])
 
-        text, confidence, rotated = page.ocr_oriented(out, self.cfg.ocr_lang)
-        if rotated:
-            log.info("page was sideways; rotated %d°", rotated)
+        if detect.has_text(cv2.imread(str(out))):
+            text, confidence, rotated = page.ocr_oriented(out, self.cfg.ocr_lang)
+            if rotated:
+                log.info("page was sideways; rotated %d°", rotated)
+        else:
+            text, confidence, rotated = "", 0.0, 0  # pictures only; nothing to OCR
         (job_dir / "ocr.txt").write_text(text)
         has_text = len(text) >= 20 and confidence >= 40
 
@@ -178,11 +205,24 @@ class Scanner:
                 files={"raw.jpg": jpg.tobytes()},
             )
 
-    def read_frame(self, cap):
-        ok, frame = cap.read()
-        if ok and self.cfg.rotate in ROTATIONS:
-            frame = cv2.rotate(frame, ROTATIONS[self.cfg.rotate])
-        return ok, frame
+    def read_frame(self, cap, tries=30):
+        """Next complete frame. The camera is read as raw MJPEG so frames truncated
+        in transfer (common over the Pi's USB) can be dropped before decoding
+        rather than decoded into garbage."""
+        for _ in range(tries):
+            ok, buf = cap.read()
+            if not ok:
+                return False, None
+            data = np.trim_zeros(buf.reshape(-1), "b")  # buffers are zero-padded
+            if len(data) < 2 or data[-2] != 0xFF or data[-1] != 0xD9:
+                continue  # no end-of-image marker: truncated
+            frame = cv2.imdecode(data, cv2.IMREAD_COLOR)
+            if frame is None:
+                continue
+            if self.cfg.rotate in ROTATIONS:
+                frame = cv2.rotate(frame, ROTATIONS[self.cfg.rotate])
+            return True, frame
+        return False, None
 
     def open_camera(self):
         cap = cv2.VideoCapture(self.cfg.device, cv2.CAP_V4L2)
@@ -191,6 +231,7 @@ class Scanner:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cfg.height)
         cap.set(cv2.CAP_PROP_FPS, self.cfg.fps)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)  # raw MJPEG; read_frame checks and decodes
         # the camera sits at a fixed height, so a fixed focus (calibrated on the first
         # page) beats autofocus, which tends to settle on the background
         if self.focus is not None:
@@ -199,9 +240,41 @@ class Scanner:
             cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)  # FocusPicker picks the sharpest frame
         if not cap.isOpened():
             raise SystemExit(f"cannot open camera {self.cfg.device}")
+        v4l2(self.cfg.device, power_line_frequency=1 if self.cfg.mains_hz == 50 else 2,
+             auto_exposure=3, white_balance_automatic=1)  # undo any manual settings
+        if self.cfg.use_background and self.background is None:  # not again on a reconnect,
+            self.learn_background(cap)                            # when a book may be in view
         log.info("camera %s at %dx%d", self.cfg.device,
                  cap.get(cv2.CAP_PROP_FRAME_WIDTH), cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         return cap
+
+    def learn_background(self, cap, settle=3.0):
+        """Let exposure settle, then remember the empty surface; pages are found as
+        whatever differs from it."""
+        end = time.monotonic() + settle
+        while time.monotonic() < end:
+            cap.read()
+        frames = [detect.background_frame(self.read_frame(cap)[1]) for _ in range(5)]
+        self.background = np.median(frames, axis=0).astype(np.uint8)
+        self.region = detect.surface_region(self.background)
+        log.info("background learned%s; keep the surface clear at startup",
+                 "" if self.region is None else " (searching on the mat)")
+
+    def dump(self, frame, found, tracker):
+        DUMP_FLAG.unlink(missing_ok=True)
+        out = self.cfg.data_dir / "debug"
+        out.mkdir(exist_ok=True)
+        marked = frame.copy()
+        for corners in found:
+            cv2.polylines(marked, [corners.astype(np.int32)], True, (0, 0, 255), 6)
+        cv2.imwrite(str(out / "frame.jpg"), marked)
+        if self.background is not None:
+            cv2.imwrite(str(out / "background.png"), self.background)
+        log.info("debug snapshot: %d page(s), tracker anchored=%s fired=%s",
+                 len(found), tracker.anchor is not None, tracker.fired)
+
+    def find_pages(self, frame):
+        return find_pages(frame, self.cfg.page_min_area, self.cfg.page_margin, self.background, self.region)
 
     def run(self):
         self.jobs.start()
@@ -211,6 +284,7 @@ class Scanner:
         stacker = None  # FrameStacker once focus has settled
         pages = []  # page corners being captured
         last_barcode_seen = 0.0
+        last_seen_log = 0.0
         n = 0
         while True:
             ok, frame = self.read_frame(cap)
@@ -228,7 +302,7 @@ class Scanner:
                     log.debug("stacked %d frames", len(stacker.frames))
                     result = stacker.result()
                     # make sure the page is still there (it may have been lifted mid-capture)
-                    if find_pages(result, self.cfg.page_min_area, self.cfg.page_margin):
+                    if self.find_pages(result):
                         self.on_page(result, pages, stacker.ref_score)
                     else:
                         log.info("page left before capture finished; skipped")
@@ -254,14 +328,28 @@ class Scanner:
                 tracker.update(None, 0, now)
                 continue
 
-            found = find_pages(frame, self.cfg.page_min_area, self.cfg.page_margin)
+            try:
+                found = self.find_pages(frame)
+            except cv2.error:
+                log.exception("page detection failed on a frame; skipped")
+                found = []
+            if DUMP_FLAG.exists():  # debugging: snapshot what the detector sees
+                self.dump(frame, found, tracker)
+            # follow slow lighting changes while the surface is clear
+            if not found and self.background is not None and n % 30 == 0 \
+                    and detect.foreground_fraction(frame, self.background) < 0.01:
+                self.background = cv2.addWeighted(self.background, 0.9, detect.background_frame(frame), 0.1, 0)
             # all pages' corners together, so the tracker and focus measure cover every page
             corners = np.vstack(found) if found else None
+            if found and now - last_seen_log >= 3 and not tracker.fired:
+                log.info("%d page(s) in view, waiting for them to hold still", len(found))
+                last_seen_log = now
             if tracker.update(corners, frame.shape[1], now):
                 if self.focus is None and self.cfg.focus == "calibrate":
                     focus_file = self.cfg.data_dir / "focus.txt"
                     center = int(focus_file.read_text()) if focus_file.exists() else DEFAULT_FOCUS
-                    self.focus = calibrate_focus(cap, self.cfg.device, corners, center)
+                    self.focus = calibrate_focus(lambda: self.read_frame(cap)[1], self.cfg.device,
+                                                 corners, center)
                     focus_file.write_text(str(self.focus))
                     log.info("focus calibrated on first page: %d", self.focus)
                     # the sweep took a while and the page may have moved or gone, so
@@ -274,6 +362,7 @@ class Scanner:
 
 def process_still(path, cfg):
     """Offline test: detect and process one image, writing results next to it."""
+    load_color_matrix(cfg.color_matrix)
     if cfg.lm_corpus:
         page.CORRECTOR = Corrector.load(cfg.lm_corpus, cfg.data_dir / "lm.pickle")
     frame = cv2.imread(str(path))
