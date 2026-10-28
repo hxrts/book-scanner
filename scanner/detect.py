@@ -196,21 +196,48 @@ def _mat_coloured(small):
     return (hsv[..., 0] >= 70) & (hsv[..., 0] <= 100) & (hsv[..., 1] > 25) & (hsv[..., 2] < 170)
 
 
-def surface_region(background, overhang=0.06):
-    """Where books can be: the cutting mat's outline in the background, widened a
-    little so a book overhanging its edge still counts. None if there's no mat."""
+def _mat_shape(background):
+    """The cutting mat in a background frame: (solid mat mask, its filled convex
+    outline), or None if there's no mat."""
     mat = _mat_coloured(background).astype(np.uint8) * 255
-    mat = cv2.morphologyEx(mat, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+    mat = cv2.morphologyEx(mat, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))  # close over the grid lines
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mat)
     if n < 2:
         return None
     biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
     if stats[biggest, cv2.CC_STAT_AREA] < 0.2 * mat.size:
         return None
-    region = np.zeros_like(mat)
-    cv2.fillConvexPoly(region, cv2.convexHull(cv2.findNonZero((labels == biggest).astype(np.uint8))), 255)
-    grow = int(overhang * mat.shape[1]) | 1
-    return cv2.dilate(region, np.ones((grow, grow), np.uint8))
+    solid = (labels == biggest).astype(np.uint8) * 255
+    outline = np.zeros_like(mat)
+    cv2.fillConvexPoly(outline, cv2.convexHull(cv2.findNonZero(solid)), 255)
+    return solid, outline
+
+
+def surface_region(background, overhang=0.06):
+    """Where books can be: 255 on the cutting mat, 128 in a margin around it (a
+    book overhanging the edge), 0 elsewhere. None if there's no mat."""
+    shape = _mat_shape(background)
+    if shape is None:
+        return None
+    _, outline = shape
+    grow = int(overhang * outline.shape[1]) | 1
+    region = cv2.dilate(outline, np.ones((grow, grow), np.uint8)) // 2
+    region[outline > 0] = 255
+    return region
+
+
+def objects_on_mat(background, min_area=0.03):
+    """Fraction of the view taken by things lying on the mat, so startup can wait
+    until it's clear before learning the background. Small intrusions (lamp feet,
+    a label) are ignored."""
+    shape = _mat_shape(background)
+    if shape is None:
+        return 0.0
+    solid, outline = shape
+    holes = cv2.bitwise_and(cv2.erode(outline, np.ones((9, 9), np.uint8)), cv2.bitwise_not(solid))
+    n, _, stats, _ = cv2.connectedComponentsWithStats(holes)
+    big = [stats[i, cv2.CC_STAT_AREA] for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] >= min_area * holes.size]
+    return sum(big) / holes.size
 
 
 def find_pages_by_background(frame, background, region=None, min_area=0.04, margin=0.02, spread_ratio=1.0):
@@ -240,6 +267,9 @@ def find_pages_by_background(frame, background, region=None, min_area=0.04, marg
         return []
     # the book can fall apart into pieces (a spread split at a dark gutter); keep all big ones
     mask = (areas[labels] >= 0.25 * areas.max()).astype(np.uint8)
+    # a book lies mostly on the mat; strips only in the margin are lighting changes
+    if region is not None and np.count_nonzero(region[mask > 0] == 255) < 0.6 * np.count_nonzero(mask):
+        return []
     # fill holes (dark print can match the dark mat) so the book is one solid shape
     outline, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(mask, outline, -1, 1, cv2.FILLED)

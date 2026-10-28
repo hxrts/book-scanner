@@ -250,28 +250,25 @@ class Scanner:
 
     def learn_background(self, cap, settle=3.0):
         """Let exposure settle, then remember the empty surface; pages are found as
-        whatever differs from it."""
+        whatever differs from it. Waits until nothing is lying on the mat."""
         end = time.monotonic() + settle
         while time.monotonic() < end:
             cap.read()
-        frames = [detect.background_frame(self.read_frame(cap)[1]) for _ in range(5)]
-        self.background = np.median(frames, axis=0).astype(np.uint8)
-        self.region = detect.surface_region(self.background)
-        log.info("background learned%s; keep the surface clear at startup",
-                 "" if self.region is None else " (searching on the mat)")
-
-    def dump(self, frame, found, tracker):
-        DUMP_FLAG.unlink(missing_ok=True)
-        out = self.cfg.data_dir / "debug"
-        out.mkdir(exist_ok=True)
-        marked = frame.copy()
-        for corners in found:
-            cv2.polylines(marked, [corners.astype(np.int32)], True, (0, 0, 255), 6)
-        cv2.imwrite(str(out / "frame.jpg"), marked)
-        if self.background is not None:
-            cv2.imwrite(str(out / "background.png"), self.background)
-        log.info("debug snapshot: %d page(s), tracker anchored=%s fired=%s",
-                 len(found), tracker.anchor is not None, tracker.fired)
+        warned = False
+        while True:
+            frames = [detect.background_frame(self.read_frame(cap)[1]) for _ in range(5)]
+            background = np.median(frames, axis=0).astype(np.uint8)
+            covered = detect.objects_on_mat(background)
+            if not covered:
+                break
+            if not warned:
+                log.warning("something is lying on the mat (%.0f%% of view); clear it to finish starting up",
+                            covered * 100)
+                warned = True
+            time.sleep(2)
+        self.background = background
+        self.region = detect.surface_region(background)
+        log.info("background learned%s", "" if self.region is None else " (searching on the mat)")
 
     def find_pages(self, frame):
         return find_pages(frame, self.cfg.page_min_area, self.cfg.page_margin, self.background, self.region)
