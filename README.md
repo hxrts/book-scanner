@@ -72,6 +72,7 @@ Set these in `scanner.env`:
 | `SCANNER_FOCUS` | `calibrate` | `calibrate` (lock on the first page each start), `auto` (continuous autofocus), or a fixed lens value 0–255 |
 | `SCANNER_ROTATE` | `0` | Rotate frames clockwise (0/90/180/270) so pages read upright |
 | `SCANNER_PAGE_MIN_AREA` | `0.15` | Smallest page, as a fraction of the frame |
+| `SCANNER_PAGE_MARGIN` | `0.12` | Padding around a page found by its text, as a fraction of its longer side |
 | `SCANNER_PAGE_STABLE_S` | `1.0` | How long a page must be still before capture |
 | `SCANNER_MIN_SHARPNESS` | `30` | Focus score below which a capture is skipped (each capture's score is logged) |
 | `SCANNER_ISBN_COOLDOWN_S` | `60` | How long a barcode must be out of view before it can be added again |

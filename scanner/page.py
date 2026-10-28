@@ -1,4 +1,4 @@
-"""Page processing: perspective correction, deskew, colour correction, OCR."""
+"""Page processing: perspective correction, deskew, colour correction, sharpening, OCR."""
 
 import subprocess
 
@@ -82,8 +82,13 @@ def trim_border(img, fraction=0.01):
     return img[dy:h - dy, dx:w - dx]
 
 
+def sharpen(img, amount=0.6, sigma=1.2):
+    """Light unsharp mask to crisp up text softened by the webcam and frame averaging."""
+    return cv2.addWeighted(img, 1 + amount, cv2.GaussianBlur(img, (0, 0), sigma), -amount, 0)
+
+
 def process(frame, corners):
-    return color_correct(deskew(trim_border(warp(frame, corners))))
+    return sharpen(color_correct(deskew(trim_border(warp(frame, corners)))))
 
 
 PROBE_WIDTH = 1200

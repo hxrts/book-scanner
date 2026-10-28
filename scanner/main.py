@@ -62,13 +62,13 @@ def calibrate_focus(cap, device, corners, center, steps=3, step=5):
     return best
 
 
-def find_pages(frame, min_area):
+def find_pages(frame, min_area, margin):
     """Pages in a full-size frame: a fully visible page by its edges, else by its text."""
     gray, small, scale = detect.downscale(frame)
     corners = detect.find_page(gray, min_area, color=small)
     if corners is not None:
         return [corners / scale]
-    return detect.find_text_pages(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+    return detect.find_text_pages(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), margin=margin)
 
 
 class Scanner:
@@ -228,7 +228,7 @@ class Scanner:
                     log.debug("stacked %d frames", len(stacker.frames))
                     result = stacker.result()
                     # make sure the page is still there (it may have been lifted mid-capture)
-                    if find_pages(result, self.cfg.page_min_area):
+                    if find_pages(result, self.cfg.page_min_area, self.cfg.page_margin):
                         self.on_page(result, pages, stacker.ref_score)
                     else:
                         log.info("page left before capture finished; skipped")
@@ -254,7 +254,7 @@ class Scanner:
                 tracker.update(None, 0, now)
                 continue
 
-            found = find_pages(frame, self.cfg.page_min_area)
+            found = find_pages(frame, self.cfg.page_min_area, self.cfg.page_margin)
             # all pages' corners together, so the tracker and focus measure cover every page
             corners = np.vstack(found) if found else None
             if tracker.update(corners, frame.shape[1], now):
@@ -286,7 +286,7 @@ def process_still(path, cfg):
         print("ISBN:", isbn)
         print(books.lookup(isbn, cfg.user_agent))
         return
-    pages = find_pages(frame, cfg.page_min_area)
+    pages = find_pages(frame, cfg.page_min_area, cfg.page_margin)
     if not pages:
         print("no page or ISBN found")
         return
