@@ -25,6 +25,7 @@ log = logging.getLogger("scanner")
 BARCODE_EVERY_N_FRAMES = 3
 TITLE_MAX = 80
 DUMP_FLAG = Path("/tmp/scanner-dump")  # touch to save a debug snapshot of detection
+CALIBRATION_PAUSE = 5  # seconds after focus calibration before scanning starts
 DEFAULT_FOCUS = 15  # BRIO over the scanning mat; calibration searches around the last value
 ROTATIONS = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
 DESCRIPTION_MAX = 20000
@@ -187,13 +188,21 @@ class Scanner:
         self.jobs.submit("isbn", {"isbn": isbn})
 
     def on_page(self, frame, pages, sharpness):
-        if sharpness < self.cfg.min_sharpness:
-            log.warning("page too blurry (sharpness %.0f < %.0f), skipped; move the page to retry",
-                        sharpness, self.cfg.min_sharpness)
+        # judge each page on its own: one page of a spread can be out of focus (lifted
+        # off the mat) while the other is fine
+        sharp = []
+        for i, corners in enumerate(pages, 1):
+            focus = detect.focus_score(page.warp(frame, corners))
+            if focus < self.cfg.min_focus:
+                log.warning("page %d of %d too blurry (focus %.2f < %.2f), discarded; rescan it",
+                            i, len(pages), focus, self.cfg.min_focus)
+            else:
+                sharp.append(corners)
+        if not sharp:
             return
-        log.info("%d page(s) captured (sharpness %.0f), queued for processing", len(pages), sharpness)
+        log.info("%d page(s) captured (sharpness %.0f), queued for processing", len(sharp), sharpness)
         ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        for corners in pages:  # a spread becomes one job per page, left to right
+        for corners in sharp:  # a spread becomes one job per page, left/top first
             self.jobs.submit(
                 "page",
                 {
@@ -239,7 +248,8 @@ class Scanner:
         else:
             cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)  # FocusPicker picks the sharpest frame
         if not cap.isOpened():
-            raise SystemExit(f"cannot open camera {self.cfg.device}")
+            log.error("cannot open camera %s", self.cfg.device)
+            raise SystemExit(1)
         v4l2(self.cfg.device, power_line_frequency=1 if self.cfg.mains_hz == 50 else 2,
              auto_exposure=3, white_balance_automatic=1)  # undo any manual settings
         if self.cfg.use_background and self.background is None:  # not again on a reconnect,
@@ -300,6 +310,8 @@ class Scanner:
         pages = []  # page corners being captured
         last_barcode_seen = 0.0
         last_seen_log = 0.0
+        paused_until = None  # after calibration, time to take the book away
+        seen_streak = 0  # consecutive frames with a page; one-off corrupt frames give false ones
         n = 0
         while True:
             ok, frame = self.read_frame(cap)
@@ -332,6 +344,13 @@ class Scanner:
                     focus = None
                 continue
 
+            if paused_until is not None:
+                if now < paused_until:
+                    continue
+                paused_until = None
+                tracker = detect.StabilityTracker(self.cfg.page_stable_seconds)
+                log.info("ready to scan")
+
             if n % BARCODE_EVERY_N_FRAMES == 0:
                 isbn = detect.find_isbn(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
                 if isbn:
@@ -356,7 +375,8 @@ class Scanner:
                 self.background = cv2.addWeighted(self.background, 0.9, detect.background_frame(frame), 0.1, 0)
             # all pages' corners together, so the tracker and focus measure cover every page
             corners = np.vstack(found) if found else None
-            if found and now - last_seen_log >= 3 and not tracker.fired:
+            seen_streak = seen_streak + 1 if found else 0
+            if seen_streak >= 3 and now - last_seen_log >= 3 and not tracker.fired:
                 log.info("%d page(s) in view, waiting for them to hold still", len(found))
                 last_seen_log = now
             if tracker.update(corners, frame.shape[1], now):
@@ -368,7 +388,8 @@ class Scanner:
                                                  corners, center)
                     focus_file.write_text(str(self.focus))
                     log.info("focus calibrated on first page: %d", self.focus)
-                    log.info("ready to scan")
+                    log.info("take the book away; scanning starts in %d s", CALIBRATION_PAUSE)
+                    paused_until = time.monotonic() + CALIBRATION_PAUSE
                     # the sweep took a while and the page may have moved or gone, so
                     # wait for a fresh steady placement rather than capturing now
                     tracker = detect.StabilityTracker(self.cfg.page_stable_seconds)

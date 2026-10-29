@@ -199,8 +199,18 @@ def _mat_coloured(small):
 def _mat_shape(background):
     """The cutting mat in a background frame: (solid mat mask, its filled convex
     outline), or None if there's no mat."""
-    mat = _mat_coloured(background).astype(np.uint8) * 255
+    seed = _mat_coloured(background)
+    if seed.sum() < 0.05 * seed.size:
+        return None
+    # lamp light shifts the mat's hue and saturation across it, so grow from the
+    # clearly mat-coloured pixels to anything close to this mat's own colour
+    lab = cv2.cvtColor(background, cv2.COLOR_BGR2LAB).astype(np.float32)
+    ref = np.median(lab[seed], axis=0)
+    chroma = np.hypot(lab[..., 1] - ref[1], lab[..., 2] - ref[2])
+    near = (chroma < 10) & (np.abs(lab[..., 0] - ref[0]) < 45)
+    mat = (seed | near).astype(np.uint8) * 255
     mat = cv2.morphologyEx(mat, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))  # close over the grid lines
+    mat = cv2.morphologyEx(mat, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))  # drop stray specks off the mat
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mat)
     if n < 2:
         return None
@@ -208,8 +218,11 @@ def _mat_shape(background):
     if stats[biggest, cv2.CC_STAT_AREA] < 0.2 * mat.size:
         return None
     solid = (labels == biggest).astype(np.uint8) * 255
+    # a cutting mat is a rectangle; fitting one also covers parts hidden by the
+    # lamp's clamp or a label
     outline = np.zeros_like(mat)
-    cv2.fillConvexPoly(outline, cv2.convexHull(cv2.findNonZero(solid)), 255)
+    box = cv2.boxPoints(cv2.minAreaRect(cv2.findNonZero(solid)))
+    cv2.fillConvexPoly(outline, box.astype(np.int32), 255)
     return solid, outline
 
 
@@ -240,6 +253,9 @@ def objects_on_mat(background, min_area=0.03):
     return sum(big) / holes.size
 
 
+GUTTER_OVERLAP = 0.03  # fraction of a page's width each crop extends past the gutter
+
+
 def find_pages_by_background(frame, background, region=None, min_area=0.04, margin=0.02, spread_ratio=1.0):
     """Find the book as whatever differs from the empty surface, so pages of any
     colour or content are found. Needs a fixed camera.
@@ -250,7 +266,7 @@ def find_pages_by_background(frame, background, region=None, min_area=0.04, marg
     """
     small = background_frame(frame)
     scale = small.shape[1] / frame.shape[1]
-    fg = (_background_diff(small, background) > 30).astype(np.uint8) * 255
+    fg = (_background_diff(small, background, None if region is None else region < 255) > 30).astype(np.uint8) * 255
     fg[cv2.dilate(_hands(small), np.ones((15, 15), np.uint8)) > 0] = 0
     # a shifted cutting mat differs from the background but is never the book
     fg[_mat_coloured(small)] = 0
@@ -297,31 +313,109 @@ def find_pages_by_background(frame, background, region=None, min_area=0.04, marg
     pad_x, pad_y = margin * (x1 - x0), margin * (y1 - y0)
     x0, x1, y0, y1 = x0 - pad_x, x1 + pad_x, y0 - pad_y, y1 + pad_y
     w, h = x1 - x0, y1 - y0
-    cuts = [x0, x1]
+    upright = cv2.warpAffine(small, to_book, (small.shape[1], small.shape[0]))
+    gray = cv2.cvtColor(upright[max(int(y0), 0):int(y1), max(int(x0), 0):int(x1)], cv2.COLOR_BGR2GRAY)
+    # boxes in the book's axes, as (left, top, right, bottom)
     if w > spread_ratio * h:
-        # the gutter is the darkest column near the middle
-        gray = cv2.cvtColor(cv2.warpAffine(small, to_book, (small.shape[1], small.shape[0])), cv2.COLOR_BGR2GRAY)
-        cols = gray[max(int(y0), 0):int(y1), max(int(x0), 0):int(x1)].mean(axis=0)
-        mid, reach = len(cols) // 2, len(cols) // 5
-        cuts = [x0, max(x0, 0) + mid - reach + int(np.argmin(cols[mid - reach:mid + reach])), x1]
+        # side by side: the gutter is where the paper itself is darkest (its shadow),
+        # near the middle. A high percentile per column measures the paper between
+        # the ink, so dark illustrations or text columns don't pull the split onto them
+        cols = np.convolve(np.percentile(gray, 95, axis=0), np.ones(3) / 3, mode="same")
+        mid, reach = len(cols) // 2, len(cols) // 8
+        window = cols[mid - reach:mid + reach]
+        # a flat-lying booklet has no gutter shadow, and the darkest column is then
+        # just the edge of the search; take the middle instead
+        darkest = int(np.argmin(window))
+        if darkest <= 2 or darkest >= len(window) - 3:
+            darkest = reach
+        cut = max(x0, 0) + mid - reach + darkest
+        overlap = GUTTER_OVERLAP * w / 2  # so a split a few pixels off doesn't cut line ends
+        boxes = [(x0, y0, cut + overlap, y1), (cut - overlap, y0, x1, y1)]
+    else:
+        # the fold is a thin line, lost at the detection scale, so look at the book in
+        # the full frame
+        box = np.array([[[x0, y0], [x1, y0], [x1, y1], [x0, y1]]], np.float32)
+        corners = order_corners(cv2.transform(box, cv2.invertAffineTransform(to_book))[0] / scale)
+        fold = _horizontal_fold(frame, corners)
+        if fold is None:
+            boxes = [(x0, y0, x1, y1)]
+        else:
+            cut = y0 + fold * h
+            overlap = GUTTER_OVERLAP * h / 2
+            boxes = [(x0, y0, x1, cut + overlap), (x0, cut - overlap, x1, y1)]
     from_book = cv2.invertAffineTransform(to_book)
     pages = []
-    for left, right in zip(cuts, cuts[1:]):
-        box = np.array([[[left, y0], [right, y0], [right, y1], [left, y1]]], np.float32)
+    for left, top, right, bottom in boxes:
+        box = np.array([[[left, top], [right, top], [right, bottom], [left, bottom]]], np.float32)
         pages.append(order_corners(cv2.transform(box, from_book)[0] / scale))
     return pages
 
 
-def _background_diff(small, background):
+def _horizontal_fold(frame, corners, reach=0.25, min_dip=0.04, height=600):
+    """Where the fold is, as a fraction of the book's height, when a book lies opened
+    top to bottom; else None.
+
+    Single pages are tall too, so this needs more evidence than a side-by-side
+    split: the book must be mostly bare paper (coloured covers make false dips)
+    and the paper must darken clearly along one row near the middle, the shadow
+    where the pages bend into the binding."""
+    tl, tr, br, bl = corners
+    width = max(2, int(height * np.linalg.norm(tr - tl) / max(np.linalg.norm(bl - tl), 1)))
+    dst = np.array([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]], np.float32)
+    book = cv2.warpPerspective(frame, cv2.getPerspectiveTransform(corners.astype(np.float32), dst), (width, height))
+    gray = cv2.cvtColor(book, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(book, cv2.COLOR_BGR2HSV)
+    if np.count_nonzero((hsv[..., 2] > 140) & (hsv[..., 1] < 60)) < 0.5 * gray.size:
+        return None
+    rows = np.convolve(np.percentile(gray, 95, axis=1), np.ones(5) / 5, mode="same")
+    lo, hi = int(len(rows) * (0.5 - reach)), int(len(rows) * (0.5 + reach))
+    window = rows[lo:hi]
+    darkest = int(np.argmin(window))
+    if darkest <= 2 or darkest >= len(window) - 3:
+        return None  # no minimum inside the search, just a gradient
+    if np.median(window) - window[darkest] < min_dip * np.median(window):
+        return None
+    return (lo + darkest) / len(rows)
+
+
+def _background_diff(small, background, steady=None):
     """Per-pixel colour difference from the background, after matching the
     background's overall colour to the frame. Auto exposure and white balance shift
-    the whole image when a book comes into view; since the book covers well under
-    half of it, the median per-channel ratio measures that shift."""
+    the whole image when a book comes into view. The shift is measured as the
+    per-channel gain that leaves the most of the view unchanged: a big book can
+    cover most of the view, so a plain median over everything would measure the
+    book instead. `steady` marks where books rarely are (off the mat); candidates
+    are judged there when enough of it is visible, since a big plain book can
+    otherwise match the mat under a wrong gain."""
     f, b = small.astype(np.float32), background.astype(np.float32)
     fs, bs = f[::4, ::4].reshape(-1, 3), b[::4, ::4].reshape(-1, 3)
     # clipped highlights can't follow an exposure change, so measure it on mid-tones
     mid = ((fs > 15) & (fs < 235) & (bs > 15) & (bs < 235)).all(axis=1)
-    gains = np.median((fs[mid] + 1) / (bs[mid] + 1), axis=0) if mid.sum() > 100 else np.ones(3)
+    ratio = (fs + 1) / (bs + 1)
+    candidates = [np.ones(3)]
+    if mid.sum() > 100:
+        candidates.append(np.median(ratio[mid], axis=0))
+        # medians over the darker and lighter halves of the background, so one of
+        # them comes from whatever the book doesn't cover (mat or desk)
+        lum = bs.mean(axis=1)
+        for part in (mid & (lum < np.median(lum[mid])), mid & (lum >= np.median(lum[mid]))):
+            if part.sum() > 100:
+                candidates.append(np.median(ratio[part], axis=0))
+
+    judge = np.ones(len(fs), bool)
+    if steady is not None:
+        steady = steady[::4, ::4].reshape(-1)
+        if steady.mean() > 0.05:
+            judge = steady
+
+    def unchanged(g):
+        return np.count_nonzero((np.abs(fs[judge] - bs[judge] * g) < 20).all(axis=1))
+
+    gains = max(candidates, key=unchanged)
+    # refine on the pixels that agree with it
+    agree = mid & (np.abs(fs - bs * gains) < 20).all(axis=1)
+    if agree.sum() > 100:
+        gains = np.median(ratio[agree], axis=0)
     matched = np.clip(b * gains, 0, 255).astype(np.uint8)
     diff = cv2.absdiff(cv2.cvtColor(small, cv2.COLOR_BGR2LAB), cv2.cvtColor(matched, cv2.COLOR_BGR2LAB)).max(axis=2)
     # near-white in both (a desk blown out by exposure) is not a change
@@ -350,7 +444,8 @@ def _hands(small):
     """Mask of hands and arms: solid skin-coloured regions reaching the frame edge.
     Red or orange covers have skin-like pixels too, but scattered among others and
     not attached to an arm coming in from outside the frame."""
-    skin = cv2.inRange(cv2.cvtColor(small, cv2.COLOR_BGR2YCrCb), (0, 136, 70), (255, 185, 125))
+    # Cr from 145: cream and off-white paper sits at ~140, hands at ~150-160
+    skin = cv2.inRange(cv2.cvtColor(small, cv2.COLOR_BGR2YCrCb), (0, 145, 70), (255, 185, 125))
     skin = cv2.morphologyEx(skin, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
     n, labels, stats, _ = cv2.connectedComponentsWithStats(skin)
     h, w = skin.shape
@@ -366,10 +461,43 @@ def foreground_fraction(frame, background):
     return float(np.count_nonzero(diff > 30)) / diff.size
 
 
-def has_text(img, min_rows=5):
-    """Whether an image (a processed page) carries enough lines of text to OCR."""
+def focus_score(img, width=600):
+    """How in focus a page image is, independent of what's printed on it.
+
+    Compares the finest detail at edges (lost to even slight defocus) with
+    medium-scale detail (which survives it), so a sparse cover and a dense text
+    page score alike. On the reference shots sharp pages scored 0.36-0.55, and
+    copies blurred by 1 pixel or more 0.31 or less."""
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    g = cv2.resize(g, (width, max(1, int(width * g.shape[0] / g.shape[1]))), interpolation=cv2.INTER_AREA)
+    b1, b3 = cv2.GaussianBlur(g, (0, 0), 1.0), cv2.GaussianBlur(g, (0, 0), 3.0)
+    fine, medium = np.abs(g - b1), np.abs(b1 - b3)
+    edges = medium > np.percentile(medium, 95)
+    if edges.sum() < 50 or medium[edges].mean() < 1:
+        return 1.0  # blank: nothing to judge, so don't reject it
+    return float(fine[edges].mean() / medium[edges].mean())
+
+
+def has_text(img, min_rows=12, min_cover=0.04):
+    """Whether an image (a processed page) is a text page worth OCR.
+
+    Counts line-shaped blobs: characters smeared sideways into long, thin bars.
+    Covers, photos and illustrations with a caption or title have a few such
+    bars; a text page has many, covering a good part of it."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    return bool(find_text_pages(gray, min_rows=min_rows, min_area=0.01))
+    scale = 800 / gray.shape[1]
+    gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    ink = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 25, 15)
+    lines = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3)))
+    contours, _ = cv2.findContours(lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    h, w = gray.shape
+    rows, area = 0, 0
+    for c in contours:
+        _, _, cw, ch = cv2.boundingRect(c)
+        if cw > 0.15 * w and cw > 6 * ch and 4 <= ch <= 0.06 * h:
+            rows += 1
+            area += cw * ch
+    return rows >= min_rows and area >= min_cover * h * w
 
 
 class StabilityTracker:

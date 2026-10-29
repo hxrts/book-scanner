@@ -1,5 +1,6 @@
 """Page processing: perspective correction, deskew, colour correction, sharpening, OCR."""
 
+import re
 import subprocess
 
 import cv2
@@ -16,12 +17,17 @@ def warp(frame, corners):
     return cv2.warpPerspective(frame, matrix, (width, height), flags=cv2.INTER_CUBIC)
 
 
+MAX_DESKEW = 5  # degrees
+
+
 def deskew(img):
     """Rotate so text lines are horizontal, using the dominant angle of text blobs."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+    # a local threshold keeps small text on tinted or unevenly lit paper
+    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 25, 15)
     # smear characters horizontally into line-shaped blobs
-    lines = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (25, 3)))
+    smear = max(15, img.shape[1] // 40)
+    lines = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (smear, 3)))
     contours, _ = cv2.findContours(lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     min_len = img.shape[1] * 0.15
@@ -37,10 +43,17 @@ def deskew(img):
     if len(angles) < 6:
         return img
     angles, weights = np.array(angles), np.array(weights)
-    angle = float(np.average(angles, weights=weights))
-    spread = float(np.sqrt(np.average((angles - angle) ** 2, weights=weights)))
-    # the perspective warp already levels the page; only correct small residual skew
-    if spread > 1.0 or abs(angle) < 0.2 or abs(angle) > 3:
+    # weighted median, then the mean of the lines that agree with it: edges of
+    # pictures and hands give stray angles that would skew a plain average
+    order = np.argsort(angles)
+    median = angles[order][np.searchsorted(np.cumsum(weights[order]), weights.sum() / 2)]
+    agree = np.abs(angles - median) < 1.0
+    if weights[agree].sum() < 0.5 * weights.sum() or agree.sum() < 6:
+        return img  # no clear text direction
+    angle = float(np.average(angles[agree], weights=weights[agree]))
+    # the perspective warp levels the page itself; only correct residual skew of the
+    # print (a page turned in the book's binding or a tilted crop)
+    if abs(angle) < 0.2 or abs(angle) > MAX_DESKEW:
         return img
 
     h, w = img.shape[:2]
@@ -63,16 +76,41 @@ def color_correct(img, strength=0.8):
 
     lab = cv2.cvtColor(np.clip(f, 0, 255).astype(np.uint8), cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    # background = lightness with text removed (closing) and heavily blurred,
-    # computed at 1/4 scale since it's smooth anyway
-    small = cv2.resize(l, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
-    k = max(5, (min(small.shape) // 30) | 1)
-    small = cv2.GaussianBlur(cv2.morphologyEx(small, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8)), (0, 0), k)
-    background = cv2.resize(small, (l.shape[1], l.shape[0]), interpolation=cv2.INTER_LINEAR)
+    background = paper_lightness(l)
     target = np.percentile(background, 90)
-    flat = l.astype(np.float32) * (target / np.maximum(background.astype(np.float32), 1))
+    # only even out lamp falloff; never brighten by more than a third, so large
+    # dark areas misread as shadow can't wash out
+    gain = np.clip(target / np.maximum(background, 1), 0.85, 1.35)
+    # and lift the paper towards white (webcam paper reads as light grey)
+    gain *= min(PAPER_WHITE / max(target, 1), 1.25)
+    flat = l.astype(np.float32) * gain
     l = np.clip((1 - strength) * l + strength * flat, 0, 255).astype(np.uint8)
     return cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+
+
+PAPER_WHITE = 242  # LAB lightness (0-255) the paper is lifted to
+
+
+def paper_lightness(l, cells=12):
+    """Smooth estimate of the bare paper's lightness across the page.
+
+    Each cell of a coarse grid takes its brightest pixels (the paper between the
+    ink); cells mostly covered by ink or pictures are replaced by their neighbours'
+    paper. Unlike blurring the image, a large black illustration can't pull the
+    estimate down and leave a halo around itself."""
+    h, w = l.shape
+    gh, gw = cells, max(2, round(cells * w / h))
+    grid = np.zeros((gh, gw), np.float32)
+    for i in range(gh):
+        for j in range(gw):
+            cell = l[i * h // gh:(i + 1) * h // gh, j * w // gw:(j + 1) * w // gw]
+            grid[i, j] = np.percentile(cell, 95)
+    # a cell darker than its neighbourhood's paper is covered by ink, not shadow
+    neighbourhood = cv2.dilate(grid, np.ones((3, 3), np.uint8))
+    covered = grid < 0.85 * neighbourhood
+    grid[covered] = cv2.medianBlur(neighbourhood, 3)[covered]
+    grid = cv2.GaussianBlur(grid, (3, 3), 0)
+    return cv2.resize(grid, (w, h), interpolation=cv2.INTER_CUBIC)
 
 
 def trim_border(img, fraction=0.01):
@@ -124,6 +162,12 @@ def ocr_oriented(image_path, lang, low_confidence=40, margin=15):
     rotated in place and OCR is rerun at full size. Returns (text, confidence, degrees).
     """
     text, conf, vertical = ocr(image_path, lang, correct=True)
+    if conf < SMALL_TEXT_RETRY_CONF:
+        # tiny or faint print: Tesseract's layout analysis can drop whole blocks at the
+        # usual settings; read it again enlarged further, and keep the more readable result
+        alt = ocr(image_path, lang, correct=True, small_text=True)
+        if _real_words(alt[0]) > _real_words(text):
+            text, conf, vertical = alt
     # Tesseract can sometimes read sideways text well, so also check word shapes
     if conf >= low_confidence and len(text) >= 20 and vertical < 0.5:
         return text, conf, 0
@@ -155,6 +199,22 @@ def ocr_oriented(image_path, lang, low_confidence=40, margin=15):
 
 
 OCR_UPSCALE = 2
+SMALL_TEXT_RETRY_CONF = 70  # below this mean confidence, also try the small-text settings
+_DICTIONARY = None
+
+
+def _real_words(text):
+    """Number of dictionary words in text, as a measure of how readable an OCR result is."""
+    global _DICTIONARY
+    if _DICTIONARY is None:
+        if CORRECTOR is not None:
+            _DICTIONARY = CORRECTOR.dictionary
+        else:
+            try:
+                _DICTIONARY = {w.strip().lower() for w in open("/usr/share/dict/words")}
+            except OSError:
+                _DICTIONARY = set()
+    return sum(1 for w in re.findall(r"[A-Za-z]{2,}", text) if w.lower() in _DICTIONARY)
 # alternative Tesseract model dir (e.g. tessdata_best); set from config at startup
 TESSDATA_DIR = None
 # correct.Corrector applied to final OCR text; set from config at startup
@@ -162,12 +222,19 @@ CORRECTOR = None
 OCR_MAX_WIDTH = 4000  # cap so very large pages don't blow up OCR time
 
 
-def prepare_for_ocr(img):
+def prepare_for_ocr(img, small_text=False):
     """Grayscale, 2x upscale and unsharp mask: webcam text is only a few pixels tall,
     and Tesseract reads it best at ~2x with crisp edges. (Benchmarked against
-    binarization and 3x, both of which did worse.)"""
+    binarization and 3x, both of which did worse on normal pages.)
+
+    small_text: for tiny or faint print, stretch the contrast so grey ink reads as
+    black and upscale 3x (on the reference shots this read 73 real words from a
+    page where the normal settings got 2)."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    scale = min(OCR_UPSCALE, OCR_MAX_WIDTH / gray.shape[1])
+    if small_text:
+        lo, hi = np.percentile(gray, 1), np.percentile(gray, 90)
+        gray = np.clip((gray.astype(np.float32) - lo) * 255 / max(hi - lo, 1), 0, 255).astype(np.uint8)
+    scale = min(3 if small_text else OCR_UPSCALE, OCR_MAX_WIDTH / gray.shape[1])
     if scale > 1:
         gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
     return cv2.addWeighted(gray, 2.0, cv2.GaussianBlur(gray, (0, 0), 1.5), -1.0, 0)
@@ -198,14 +265,15 @@ def _join_hyphenated(words, confs):
     return out, out_confs
 
 
-def ocr(image_path, lang, correct=False):
+def ocr(image_path, lang, correct=False, small_text=False):
     """Run Tesseract; returns (text, mean word confidence 0-100, fraction of words taller than wide).
 
     With correct=True and a CORRECTOR configured, uncertain words are fixed using context.
     """
     prepared = image_path.with_name(image_path.stem + ".ocr.png")
-    cv2.imwrite(str(prepared), prepare_for_ocr(cv2.imread(str(image_path))))
-    cmd = ["tesseract", str(prepared), "stdout", "-l", lang, "--psm", "3", "--dpi", "300"]
+    cv2.imwrite(str(prepared), prepare_for_ocr(cv2.imread(str(image_path)), small_text))
+    # psm 4 (a single column) finds the lines that full layout analysis drops on small print
+    cmd = ["tesseract", str(prepared), "stdout", "-l", lang, "--psm", "4" if small_text else "3", "--dpi", "300"]
     if TESSDATA_DIR:
         cmd += ["--tessdata-dir", TESSDATA_DIR]
     try:

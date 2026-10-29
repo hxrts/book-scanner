@@ -30,14 +30,44 @@ svc() { sudo systemctl "$@" scanner; }
 if [ -t 1 ]; then G=$'\e[32m' D=$'\e[2m' R=$'\e[31m' N=$'\e[0m'; else G= D= R= N=; fi
 say()  { echo "${G}$*${N}"; }
 hint() { echo "${D}$*${N}"; }
-# live status feed; Ctrl+C stops watching, the scanner keeps running
-feed() { hint "watching (Ctrl+C to stop watching; the scanner keeps running)"
-         journalctl -u scanner -f -n "${1:-0}" -o cat | (cd ~/scanner && exec .venv/bin/python -m scanner.watch); }
+# live status feed from CURSOR (taken before starting, so nothing is missed) or the last N lines;
+# Ctrl+C stops watching, the scanner keeps running
+feed() { hint "live status below (Ctrl+C stops watching; the scanner keeps running)"
+         local from=(-n "${1:-30}"); [ -n "${CURSOR:-}" ] && from=(--after-cursor "$CURSOR")
+         # don't echo keys pressed while watching (arrows and scrolling show up as ^[[B)
+         if [ -t 0 ]; then TTY_SAVED=$(stty -g); stty -echo; trap 'stty "$TTY_SAVED"' EXIT; fi
+         journalctl -u scanner -f "${from[@]}" -o cat | (cd ~/scanner && exec .venv/bin/python -m scanner.watch) || true; }
+# stop the service and any scanner started by hand (python -m scanner.main), which would
+# otherwise hold the camera
+# the command line must start with the python binary, so shells that merely mention it don't match
+HAND='^[^ ]*python[0-9.]* -m scanner\.main( |$)'
+stop_all() {
+  if systemctl -q is-active scanner; then svc stop; hint "stopped the running scanner service"; fi
+  local pids; pids=$(pgrep -f "$HAND" || true)
+  if [ -n "$pids" ]; then
+    hint "stopping scanner started by hand (pid $(echo $pids))"
+    kill $pids 2>/dev/null || sudo kill $pids
+    for _ in $(seq 10); do pgrep -f "$HAND" >/dev/null || break; sleep 0.5; done
+    pkill -9 -f "$HAND" 2>/dev/null || sudo pkill -9 -f "$HAND" || true
+  fi
+}
+# start or restart, then follow along from that moment
+launch() {
+  local dev; dev=$(grep -s '^SCANNER_DEVICE=' "$ENV" | cut -d= -f2 || true); dev=${dev:-/dev/video0}
+  if [ ! -e "$dev" ]; then
+    echo "${R}webcam $dev not found; not starting${N}"
+    hint "check its USB cable; if it keeps dropping out, the Pi's power supply is too weak (see: dmesg | grep -i voltage)"
+    exit 1
+  fi
+  stop_all
+  CURSOR=$(journalctl -u scanner -n 1 -q --show-cursor | sed -n 's/^-- cursor: //p')
+  svc start; say "scanner ${2}"; feed
+}
 
 case "${1:-}" in
-  start)   svc start;   say "scanner started"; feed ;;
-  stop)    svc stop;    say "scanner stopped" ;;
-  restart) svc restart; say "scanner restarted"; feed ;;
+  start)   launch start started ;;
+  stop)    stop_all;    say "scanner stopped" ;;
+  restart) launch restart restarted ;;
   status)
     if systemctl -q is-active scanner; then say "running"; else echo "${R}not running${N}"; fi
     journalctl -u scanner -n 30 --no-pager -o cat | (cd ~/scanner && .venv/bin/python -m scanner.watch) | tail -8 ;;
@@ -45,7 +75,7 @@ case "${1:-}" in
   raw)     journalctl -u scanner -f -n 30 -o cat ;;
   calibrate)
     [ "${2:-}" = "--full" ] && rm -f "$DATA/focus.txt"
-    svc restart; say "recalibrating"; feed ;;
+    launch restart "restarted to recalibrate" ;;
   color)
     ref=${2:?usage: scanner color REF [PAGE]}
     page=${3:-$(ls -t "$DATA"/done/*/page.jpg 2>/dev/null | head -1)}

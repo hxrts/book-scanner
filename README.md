@@ -84,7 +84,7 @@ Set these in `scanner.env`:
 | `SCANNER_PAGE_MIN_AREA` | `0.15` | Smallest page, as a fraction of the frame |
 | `SCANNER_PAGE_MARGIN` | `0.12` | Padding around a page found by its text, as a fraction of its longer side |
 | `SCANNER_PAGE_STABLE_S` | `1.0` | How long a page must be still before capture |
-| `SCANNER_MIN_SHARPNESS` | `30` | Focus score below which a capture is skipped (each capture's score is logged) |
+| `SCANNER_MIN_FOCUS` | `0.33` | Focus score (0-1, independent of page content) below which a page is discarded and a rescan recommended |
 | `SCANNER_ISBN_COOLDOWN_S` | `60` | How long a barcode must be out of view before it can be added again |
 | `SCANNER_KEEP_MB` | `2048` | Image storage cap; oldest finished scans are deleted first, pending ones never |
 | `SCANNER_OCR_LANG` | `eng` | Tesseract language(s), e.g. `eng+deu` |
@@ -100,6 +100,13 @@ Set these in `scanner.env`:
 - On a Pi 3, processing and upload take about 1–1.5 min per page; captures queue while you keep scanning.
 
 ## Tests
+
+`test-images/reference/` (gitignored; on the Pi and in the local repo) holds raw camera shots of ten varied pages (covers, colour, text, illustrations, side-by-side and top-to-bottom spreads, hands, a book larger than the mat) plus the empty mat. To check detection, cropping, colour and OCR against them, run this on the Pi and inspect `sheet.jpg`:
+
+```sh
+python -m scanner.refcheck test-images/reference /tmp/refcheck [--ocr] [--only 03,07]
+```
+
 
 ```sh
 python3 -m unittest discover tests

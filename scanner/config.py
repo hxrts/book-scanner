@@ -34,7 +34,7 @@ class Config:
     page_margin: float = field(default_factory=lambda: float(_env("SCANNER_PAGE_MARGIN", "0.12")))
     page_stable_seconds: float = field(default_factory=lambda: float(_env("SCANNER_PAGE_STABLE_S", "1.0")))
     # minimum Laplacian-variance focus score for a page capture (logged per capture; tune from logs)
-    min_sharpness: float = field(default_factory=lambda: float(_env("SCANNER_MIN_SHARPNESS", "30")))
+    min_focus: float = field(default_factory=lambda: float(_env("SCANNER_MIN_FOCUS", "0.33")))
     isbn_cooldown_seconds: float = field(default_factory=lambda: float(_env("SCANNER_ISBN_COOLDOWN_S", "60")))
 
     # storage
