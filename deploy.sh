@@ -17,6 +17,7 @@ mkdir -p ~/.config/scanner
 [ -f ~/.config/scanner/scanner.env ] || cp deploy/scanner.env.example ~/.config/scanner/scanner.env
 sudo cp deploy/scanner.service /etc/systemd/system/scanner.service
 sudo install -m 755 deploy/scanner-cli /usr/local/bin/scanner
+sudo install -m 644 deploy/99-scanner-led.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger --action=add --subsystem-match=leds
 sudo systemctl daemon-reload
 ENV=~/.config/scanner/scanner.env
 if grep -q '^ARENA_TOKEN=.\+' $ENV && grep -q '^GOOGLE_SHEET_ID=.\+' $ENV; then

@@ -53,6 +53,8 @@ Recommended timings (Pi 3, BRIO at 1080p):
 
 Pages scanned after a barcode are tagged with that book in their Are.na metadata.
 
+The Pi's green LED shows the scanner's state: **off** ready for a page, **solid** page held still and being captured, **blinking** the last page was too blurry and was discarded, so rescan it (it keeps blinking until the next page goes down). The udev rule in `deploy/` lets the scanner drive it; when the scanner stops, the LED goes back to flashing on SD card activity.
+
 Test on a still image without uploading:
 
 ```sh

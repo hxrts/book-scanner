@@ -19,6 +19,7 @@ from . import books, detect, page
 from .correct import Corrector
 from .config import Config
 from .jobs import JobQueue, PermanentError
+from .led import StatusLed
 
 log = logging.getLogger("scanner")
 
@@ -198,6 +199,8 @@ class Scanner:
                             i, len(pages), focus, self.cfg.min_focus)
             else:
                 sharp.append(corners)
+        if len(sharp) < len(pages):
+            self.led.blink()
         if not sharp:
             return
         log.info("%d page(s) captured (sharpness %.0f), queued for processing", len(sharp), sharpness)
@@ -299,6 +302,7 @@ class Scanner:
 
     def run(self):
         self.jobs.start()
+        self.led = StatusLed()
         cap = self.open_camera()
         if self.focus is None and self.cfg.focus == "calibrate":
             log.info("ready to calibrate: put the open book down and hold it still")
@@ -329,6 +333,7 @@ class Scanner:
                     log.debug("stacked %d frames", len(stacker.frames))
                     result = stacker.result()
                     # make sure the page is still there (it may have been lifted mid-capture)
+                    self.led.off()  # ready for the next page, unless on_page finds it blurry
                     if self.find_pages(result):
                         self.on_page(result, pages, stacker.ref_score)
                     else:
@@ -376,6 +381,12 @@ class Scanner:
             # all pages' corners together, so the tracker and focus measure cover every page
             corners = np.vstack(found) if found else None
             seen_streak = seen_streak + 1 if found else 0
+            # LED: on while a new page is held, off once it's gone (a blurry-page blink
+            # stays until the next page is put down)
+            if seen_streak >= 3 and not tracker.fired:
+                self.led.on()
+            elif not found and self.led.state == "on":
+                self.led.off()
             if seen_streak >= 3 and now - last_seen_log >= 3 and not tracker.fired:
                 log.info("%d page(s) in view, waiting for them to hold still", len(found))
                 last_seen_log = now
@@ -390,6 +401,7 @@ class Scanner:
                     log.info("focus calibrated on first page: %d", self.focus)
                     log.info("take the book away; scanning starts in %d s", CALIBRATION_PAUSE)
                     paused_until = time.monotonic() + CALIBRATION_PAUSE
+                    self.led.off()
                     # the sweep took a while and the page may have moved or gone, so
                     # wait for a fresh steady placement rather than capturing now
                     tracker = detect.StabilityTracker(self.cfg.page_stable_seconds)

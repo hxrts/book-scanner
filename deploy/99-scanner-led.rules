@@ -1,0 +1,3 @@
+# Let the gpio group (which includes pi) drive the green activity LED, used by the
+# scanner as a status light
+SUBSYSTEM=="leds", KERNEL=="ACT", ACTION=="add", RUN+="/bin/chgrp gpio /sys%p/trigger /sys%p/brightness", RUN+="/bin/chmod g+w /sys%p/trigger /sys%p/brightness"
