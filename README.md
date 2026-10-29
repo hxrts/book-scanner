@@ -33,7 +33,9 @@ Then fill in `~/.config/scanner/scanner.env` on the Pi (template: `deploy/scanne
 - **Google Sheets:** create a service account with the Sheets API enabled, put its JSON key at `~/.config/scanner/service-account.json`, and share the sheet with its `client_email` as Editor. Set `GOOGLE_SHEET_ID`.
 - **Are.na:** a personal access token with **write** scope (`ARENA_TOKEN`) and the channel slug (`ARENA_CHANNEL`).
 
-Run `./deploy.sh` again to start the service. Logs: `journalctl -u scanner -f`.
+Run `./deploy.sh` again to start the service.
+
+On the Pi, the `scanner` command controls it: `scanner start|stop|restart|status|logs`, `scanner calibrate [--full]`, `scanner color REF [PAGE]` (fit colour correction from a reference image), `scanner pending`, `scanner snapshot`, `scanner config`, `scanner boot on|off`. Run `scanner` alone for help.
 
 ## Usage
 
@@ -96,3 +98,11 @@ Set these in `scanner.env`:
 - Pages found by their text are cropped to the text block plus a margin, not the paper edge; a page of only pictures is found only if all four of its edges are visible.
 - Text under fingers is lost, so keep hands at the margins.
 - On a Pi 3, processing and upload take about 1–1.5 min per page; captures queue while you keep scanning.
+
+## Tests
+
+```sh
+python3 -m unittest discover tests
+```
+
+These cover the status feed and the `scanner` command, and need only the Python standard library.

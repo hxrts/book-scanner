@@ -1,0 +1,71 @@
+#!/bin/bash
+# Control the book scanner on the Pi. Installed as `scanner` by deploy.sh.
+set -euo pipefail
+DATA=${SCANNER_DATA_DIR:-~/scanner-data}
+ENV=~/.config/scanner/scanner.env
+
+usage() {
+  cat <<'EOF'
+usage: scanner <command>
+
+  start             start scanning and show the live feed
+  stop              stop scanning
+  restart           restart (re-learns the mat, recalibrates focus)
+  status            is it running, plus the last few log lines
+  logs              live status feed (Ctrl+C to stop watching)
+  raw               the unformatted log
+  calibrate [--full]
+                    recalibrate focus on the next page; --full forgets the
+                    saved focus and sweeps around the default
+  color REF [PAGE]  fit colour correction from a reference image of a scanned
+                    page (PAGE defaults to the latest scan), then restart
+  pending           pages waiting to be processed or uploaded
+  snapshot          save what the detector sees to ~/scanner-data/debug
+  config            edit settings, then restart
+  boot on|off       start automatically at boot, or not
+EOF
+}
+
+svc() { sudo systemctl "$@" scanner; }
+if [ -t 1 ]; then G=$'\e[32m' D=$'\e[2m' R=$'\e[31m' N=$'\e[0m'; else G= D= R= N=; fi
+say()  { echo "${G}$*${N}"; }
+hint() { echo "${D}$*${N}"; }
+# live status feed; Ctrl+C stops watching, the scanner keeps running
+feed() { hint "watching (Ctrl+C to stop watching; the scanner keeps running)"
+         journalctl -u scanner -f -n "${1:-0}" -o cat | (cd ~/scanner && exec .venv/bin/python -m scanner.watch); }
+
+case "${1:-}" in
+  start)   svc start;   say "scanner started"; feed ;;
+  stop)    svc stop;    say "scanner stopped" ;;
+  restart) svc restart; say "scanner restarted"; feed ;;
+  status)
+    if systemctl -q is-active scanner; then say "running"; else echo "${R}not running${N}"; fi
+    journalctl -u scanner -n 30 --no-pager -o cat | (cd ~/scanner && .venv/bin/python -m scanner.watch) | tail -8 ;;
+  logs)    feed 30 ;;
+  raw)     journalctl -u scanner -f -n 30 -o cat ;;
+  calibrate)
+    [ "${2:-}" = "--full" ] && rm -f "$DATA/focus.txt"
+    svc restart; say "recalibrating"; feed ;;
+  color)
+    ref=${2:?usage: scanner color REF [PAGE]}
+    page=${3:-$(ls -t "$DATA"/done/*/page.jpg 2>/dev/null | head -1)}
+    [ -n "$page" ] || { echo "no scanned page found; scan one first" >&2; exit 1; }
+    echo "fitting against $page"
+    cd ~/scanner && .venv/bin/python -m scanner.colorfit "$ref" "$page"
+    svc restart; say "restarted with the new colour correction" ;;
+  pending) ls -1 "$DATA/pending" 2>/dev/null || echo "nothing pending" ;;
+  snapshot)
+    touch /tmp/scanner-dump
+    for _ in $(seq 20); do [ -e /tmp/scanner-dump ] || break; sleep 0.5; done
+    [ -e /tmp/scanner-dump ] && { rm -f /tmp/scanner-dump; echo "no snapshot; is the scanner running?" >&2; exit 1; }
+    ls -l "$DATA/debug" ;;
+  config)  ${EDITOR:-nano} "$ENV"; svc restart; say "restarted with new settings" ;;
+  boot)
+    case "${2:-}" in
+      on)  svc enable;  say "will start at boot" ;;
+      off) svc disable; say "won't start at boot" ;;
+      *)   usage; exit 1 ;;
+    esac ;;
+  ""|-h|--help|help) usage ;;
+  *) echo "unknown command: $1" >&2; usage; exit 1 ;;
+esac

@@ -251,6 +251,7 @@ class Scanner:
     def learn_background(self, cap, settle=3.0):
         """Let exposure settle, then remember the empty surface; pages are found as
         whatever differs from it. Waits until nothing is lying on the mat."""
+        log.info("learning the empty mat; keep it clear")
         end = time.monotonic() + settle
         while time.monotonic() < end:
             cap.read()
@@ -273,9 +274,26 @@ class Scanner:
     def find_pages(self, frame):
         return find_pages(frame, self.cfg.page_min_area, self.cfg.page_margin, self.background, self.region)
 
+    def dump(self, frame, found, tracker):
+        """Save the frame (with detected pages outlined) and the background, then clear the flag."""
+        out = self.cfg.data_dir / "debug"
+        out.mkdir(parents=True, exist_ok=True)
+        marked = frame.copy()
+        for corners in found:
+            cv2.polylines(marked, [corners.astype(np.int32)], True, (0, 0, 255), 3)
+        cv2.imwrite(str(out / "frame.jpg"), marked)
+        if self.background is not None:
+            cv2.imwrite(str(out / "background.png"), self.background)
+        DUMP_FLAG.unlink(missing_ok=True)
+        log.info("debug snapshot: %d page(s), saved to %s", len(found), out)
+
     def run(self):
         self.jobs.start()
         cap = self.open_camera()
+        if self.focus is None and self.cfg.focus == "calibrate":
+            log.info("ready to calibrate: put the open book down and hold it still")
+        else:
+            log.info("ready to scan")
         tracker = detect.StabilityTracker(self.cfg.page_stable_seconds)
         focus = None  # FocusPicker while settling on a capture
         stacker = None  # FrameStacker once focus has settled
@@ -345,16 +363,19 @@ class Scanner:
                 if self.focus is None and self.cfg.focus == "calibrate":
                     focus_file = self.cfg.data_dir / "focus.txt"
                     center = int(focus_file.read_text()) if focus_file.exists() else DEFAULT_FOCUS
+                    log.info("calibrating focus; hold still")
                     self.focus = calibrate_focus(lambda: self.read_frame(cap)[1], self.cfg.device,
                                                  corners, center)
                     focus_file.write_text(str(self.focus))
                     log.info("focus calibrated on first page: %d", self.focus)
+                    log.info("ready to scan")
                     # the sweep took a while and the page may have moved or gone, so
                     # wait for a fresh steady placement rather than capturing now
                     tracker = detect.StabilityTracker(self.cfg.page_stable_seconds)
                     continue
                 pages = found
                 focus = detect.FocusPicker(frame, corners, now)
+                log.info("capturing; hold still")
 
 
 def process_still(path, cfg):
